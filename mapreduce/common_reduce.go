@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"sort"
+)
+
 // doReduce manages one reduce task: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
@@ -11,36 +18,59 @@ func doReduce(
 	nMap int, // the number of map tasks that were run ("M" in the paper)
 	reduceF func(key string, values []string) string,
 ) {
-	//
-	// You will need to write this function.
-	//
-	// You'll need to read one intermediate file from each map task;
-	// reduceName(jobName, m, reduceTaskNumber) yields the file
-	// name from map task m.
-	//
-	// Your doMap() encoded the key/value pairs in the intermediate
-	// files, so you will need to decode them. If you used JSON, you can
-	// read and decode by creating a decoder and repeatedly calling
-	// .Decode(&kv) on it until it returns an error.
-	//
-	// You may find the first example in the golang sort package
-	// documentation useful.
-	//
-	// reduceF() is the application's reduce function. You should
-	// call it once per distinct key, with a slice of all the values
-	// for that key. reduceF() returns the reduced value for that key.
-	//
-	// You should write the reduce output as JSON encoded KeyValue
-	// objects to the file named outFile. We require you to use JSON
-	// because that is what the merger than combines the output
-	// from all the reduce tasks expects. There is nothing special about
-	// JSON -- it is just the marshalling format we chose to use. Your
-	// output code will look something like this:
-	//
-	// enc := json.NewEncoder(file)
-	// for key := ... {
-	// 	enc.Encode(KeyValue{key, reduceF(...)})
-	// }
-	// file.Close()
-	//
+	// Opening all temp files
+	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Starting to process %d files", nMap))
+	var decoders = make([]*json.Decoder, nMap)
+	for i := 0; i < nMap; i++ {
+		fileName := reduceName(jobName, i, reduceTaskNumber)
+		fd, err := os.OpenFile(fileName, os.O_RDONLY, 0600)
+		if err != nil {
+			debugReducer("Error", jobName, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", fileName))
+			return
+		}
+		decoders[i] = json.NewDecoder(fd)
+		defer fd.Close()
+	}
+
+	kvs := make(map[string][]string)
+
+	// Unmarshal all temp files and collate key-values
+	for i := 0; i < nMap; i++ {
+		var kv *KeyValue
+		for {
+			err := decoders[i].Decode(&kv)
+			if err != nil {
+				break
+			}
+			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
+		}
+	}
+	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Read %d keys from %d files", len(kvs), nMap))
+
+	// Sort by key
+	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Sorting data by keys"))
+	var keys []string
+	for k := range kvs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Create output file
+	fd, err := os.OpenFile(outFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		debugReducer("Error", jobName, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", outFile))
+		return
+	}
+	defer fd.Close()
+
+	// Apply reduce f() and write results
+	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Applying reduce f() and writing to output file: %s", outFile))
+	encoder := json.NewEncoder(fd)
+	for _, key := range keys {
+		encoder.Encode(KeyValue{key, reduceF(key, kvs[key])})
+	}
+}
+
+func debugReducer(level string, jobName string, reduceTaskNumber int, message string) {
+	debug(fmt.Sprintf("%s: [%s, Reducer:#%d] %s\n", level, jobName, reduceTaskNumber, message))
 }
