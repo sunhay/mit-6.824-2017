@@ -2,6 +2,7 @@ package mapreduce
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 )
 
@@ -14,6 +15,14 @@ func debug(format string, a ...interface{}) (n int, err error) {
 		n, err = fmt.Printf(format, a...)
 	}
 	return
+}
+
+func logInfo(jobName string, phase jobPhase, taskNumber int, message string) {
+	log.Printf("[%s, %s:#%d] %s\n", jobName, phase, taskNumber, message)
+}
+
+func logFatal(jobName string, phase jobPhase, taskNumber int, message string) {
+	log.Fatalf("[%s, %s:#%d] %s\n", jobName, phase, taskNumber, message)
 }
 
 // jobPhase indicates whether a task is scheduled as a map or reduce task.

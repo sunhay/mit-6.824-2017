@@ -19,13 +19,13 @@ func doReduce(
 	reduceF func(key string, values []string) string,
 ) {
 	// Opening all temp files
-	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Starting to process %d files", nMap))
+	logInfo(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Starting to process %d files", nMap))
 	var decoders = make([]*json.Decoder, nMap)
 	for i := 0; i < nMap; i++ {
 		fileName := reduceName(jobName, i, reduceTaskNumber)
 		fd, err := os.OpenFile(fileName, os.O_RDONLY, 0600)
 		if err != nil {
-			debugReducer("Error", jobName, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", fileName))
+			logFatal(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", fileName))
 			return
 		}
 		decoders[i] = json.NewDecoder(fd)
@@ -45,10 +45,10 @@ func doReduce(
 			kvs[kv.Key] = append(kvs[kv.Key], kv.Value)
 		}
 	}
-	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Read %d keys from %d files", len(kvs), nMap))
+	logInfo(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Read %d keys from %d files", len(kvs), nMap))
 
 	// Sort by key
-	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Sorting data by keys"))
+	logInfo(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Sorting data by keys"))
 	var keys []string
 	for k := range kvs {
 		keys = append(keys, k)
@@ -58,19 +58,15 @@ func doReduce(
 	// Create output file
 	fd, err := os.OpenFile(outFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
-		debugReducer("Error", jobName, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", outFile))
+		logFatal(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Failed to open: %s", outFile))
 		return
 	}
 	defer fd.Close()
 
 	// Apply reduce f() and write results
-	debugReducer("Info", jobName, reduceTaskNumber, fmt.Sprintf("Applying reduce f() and writing to output file: %s", outFile))
+	logInfo(jobName, reducePhase, reduceTaskNumber, fmt.Sprintf("Applying reduce f() and writing to output file: %s", outFile))
 	encoder := json.NewEncoder(fd)
 	for _, key := range keys {
 		encoder.Encode(KeyValue{key, reduceF(key, kvs[key])})
 	}
-}
-
-func debugReducer(level string, jobName string, reduceTaskNumber int, message string) {
-	debug(fmt.Sprintf("%s: [%s, Reducer:#%d] %s\n", level, jobName, reduceTaskNumber, message))
 }

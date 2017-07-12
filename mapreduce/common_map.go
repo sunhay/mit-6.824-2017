@@ -18,10 +18,10 @@ func doMap(
 	nReduce int, // the number of reduce task that will be run ("R" in the paper)
 	mapF func(file string, contents string) []KeyValue,
 ) {
-	debugMapper("Info", jobName, mapTaskNumber, fmt.Sprintf("Processing file: %s", inFile))
+	logInfo(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Processing file: %s", inFile))
 	data, err := ioutil.ReadFile(inFile)
 	if err != nil {
-		debugMapper("Error", jobName, mapTaskNumber, fmt.Sprintf("Failed to read input: %s", inFile))
+		logFatal(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Failed to read input: %s", inFile))
 	}
 
 	// Opening all temp files
@@ -31,7 +31,7 @@ func doMap(
 		fileName := reduceName(jobName, mapTaskNumber, i)
 		fd, err = os.OpenFile(fileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
-			debugMapper("Error", jobName, mapTaskNumber, fmt.Sprintf("Failed to open: %s", fileName))
+			logFatal(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Failed to open: %s", fileName))
 			return
 		}
 		encoders[i] = json.NewEncoder(fd)
@@ -40,22 +40,18 @@ func doMap(
 
 	// Apply map f()
 	kvs := mapF(inFile, string(data))
-	debugMapper("Info", jobName, mapTaskNumber, fmt.Sprintf("Applied map f(), returned %d key-values", len(kvs)))
+	logInfo(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Applied map f(), returned %d key-values", len(kvs)))
 
 	// Marshal and write all K-V pairs to temp files
 	for _, kv := range kvs {
 		r := ihash(kv.Key) % nReduce
 		err = encoders[r].Encode(kv)
 		if err != nil {
-			debugMapper("Error", jobName, mapTaskNumber, fmt.Sprintf("Failed to marshal/write k: %s, v: %s", kv.Key, kv.Value))
+			logFatal(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Failed to marshal/write k: %s, v: %s", kv.Key, kv.Value))
 			return
 		}
 	}
-	debugMapper("Info", jobName, mapTaskNumber, fmt.Sprintf("Processed file: %s", inFile))
-}
-
-func debugMapper(level string, jobName string, mapTaskNumber int, message string) {
-	debug(fmt.Sprintf("%s: [%s, Mapper:#%d] %s\n", level, jobName, mapTaskNumber, message))
+	logInfo(jobName, mapPhase, mapTaskNumber, fmt.Sprintf("Processed file: %s", inFile))
 }
 
 func ihash(s string) int {
