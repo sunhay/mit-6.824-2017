@@ -24,6 +24,7 @@ import (
 	and: 93990
 	the: 154024
 */
+// Or just run `bash ./test-wc.sh`
 
 //
 // The map function is called once for each file of input. The first
