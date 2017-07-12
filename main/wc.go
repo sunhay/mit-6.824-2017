@@ -2,9 +2,28 @@ package main
 
 import (
 	"fmt"
-	"mapreduce"
 	"os"
+	"strconv"
+	"strings"
+	"unicode"
+
+	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/mapreduce"
 )
+
+// Run using `time go run wc.go master sequential pg-*.txt`
+// Correct if `sort -n -k2 mrtmp.wcseq | tail -10` produces:
+/*
+	he: 34077
+	was: 37044
+	that: 37495
+	I: 44502
+	in: 46092
+	a: 60558
+	to: 74357
+	of: 79727
+	and: 93990
+	the: 154024
+*/
 
 //
 // The map function is called once for each file of input. The first
@@ -14,7 +33,12 @@ import (
 // of key/value pairs.
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
-	// TODO: you have to write this function
+	words := strings.FieldsFunc(contents, func(r rune) bool { return !unicode.IsLetter(r) })
+	kvs := make([]mapreduce.KeyValue, 1)
+	for _, word := range words {
+		kvs = append(kvs, mapreduce.KeyValue{word, "1"})
+	}
+	return kvs
 }
 
 //
@@ -23,7 +47,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 // any map task.
 //
 func reduceF(key string, values []string) string {
-	// TODO: you also have to write this function
+	return strconv.Itoa(len(values))
 }
 
 // Can be run in 3 ways:
