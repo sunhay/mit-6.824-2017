@@ -51,7 +51,6 @@ func schedule(
 	// Ready worker channel. Buffer size = number of tasks
 	readyChan := make(chan string, ntasks)
 	retryChan := make(chan *DoTaskArgs, ntasks)
-	tasksToRetry := make([]*DoTaskArgs, 0)
 	failureCounts := WorkerFailureCount{workers: make(map[string]int)}
 
 	// Helper to start task
@@ -60,47 +59,45 @@ func schedule(
 		success := call(worker, "Worker.DoTask", args, nil)
 		readyChan <- worker
 		if !success {
+			fmt.Printf("Schedule: %v task #%d failed to execute by %s\n", phase, args.TaskNumber, worker)
 			failureCounts.inc(worker)
 			retryChan <- args
 		}
 	}
 
-	// Helper to get args for next task - returns (isRetry, args)
-	getNextTaskArgs := func(worker string, currentTask int) (bool, *DoTaskArgs) {
-		if len(tasksToRetry) > 0 {
-			index := len(tasksToRetry) - 1
-			args := tasksToRetry[index]
-			tasksToRetry = tasksToRetry[:index]
-			fmt.Printf("Schedule: %v task #%d attempting to be retried by %s\n", phase, args.TaskNumber, worker)
-			return true, args
-		}
-		return false, &DoTaskArgs{
+	// Create task list
+	tasks := make([]*DoTaskArgs, 0)
+	for currentTask := 0; currentTask < ntasks; currentTask++ {
+		args := &DoTaskArgs{
 			JobName:       jobName,
 			File:          mapFiles[currentTask], // Ignored for reduce phase
 			Phase:         phase,
 			TaskNumber:    currentTask,
 			NumOtherPhase: nOther,
 		}
+		tasks = append(tasks, args)
 	}
 
 	// Assign tasks to registered + available workers
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, nOther)
-	for currentTask := 0; currentTask < ntasks; {
+	for len(tasks) > 0 {
 		select {
-		case taskArgs := <-retryChan: // Add task to retry list
-			tasksToRetry = append(tasksToRetry, taskArgs)
-		case worker := <-registerChan: // New worker registering, set them as available
+		case taskArgs := <-retryChan: // Add "retry" task back to task list
+			tasks = append(tasks, taskArgs)
+		case worker := <-registerChan: // New worker is registering, forward them to ready channel
 			readyChan <- worker
-		case worker := <-readyChan: // Worker is ready to start another task
+		case worker := <-readyChan:
 			if failureCounts.get(worker) < MaxWorkerFailures {
+				// Pop from back of task and execute
 				waitGroup.Add(1)
-				isRetry, args := getNextTaskArgs(worker, currentTask)
-				if !isRetry {
-					currentTask++
-				}
+				index := len(tasks) - 1
+				args := tasks[index]
+				tasks = tasks[:index]
 				go startTask(worker, args)
+			} else {
+				// Workers that have failed more than `MaxWorkerFailures` will not be added back to ready worker channel
+				fmt.Printf("Schedule: %v, Worker %s failed %d times and will no longer be used\n", phase, worker, MaxWorkerFailures)
 			}
-		default:
 		}
 	}
 
