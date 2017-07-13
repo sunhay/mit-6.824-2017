@@ -1,6 +1,39 @@
 package mapreduce
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+)
+
+type RegisteredWorkers struct {
+	sync.Mutex
+	workers map[string]bool // worker srv -> is available?
+}
+
+func (r *RegisteredWorkers) setWorkerBusy(srv string) {
+	r.Lock()
+	defer r.Unlock()
+	r.workers[srv] = false
+}
+
+func (r *RegisteredWorkers) setWorkerAvailable(srv string) {
+	r.Lock()
+	defer r.Unlock()
+	r.workers[srv] = true
+}
+
+func (r *RegisteredWorkers) getAvailableWorker() (string, error) {
+	r.Lock()
+	defer r.Unlock()
+	for worker, isAvailable := range r.workers {
+		if isAvailable {
+			return worker, nil
+		}
+	}
+	return "", errors.New("No available workers")
+}
 
 //
 // schedule() starts and waits for all tasks in the given phase (Map
@@ -11,26 +44,56 @@ import "fmt"
 // suitable for passing to call(). registerChan will yield all
 // existing registered workers (if any) and new ones as they register.
 //
-func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
-	var ntasks int
-	var n_other int // number of inputs (for reduce) or outputs (for map)
-	switch phase {
-	case mapPhase:
-		ntasks = len(mapFiles)
-		n_other = nReduce
-	case reducePhase:
-		ntasks = nReduce
-		n_other = len(mapFiles)
+func schedule(
+	jobName string,
+	mapFiles []string,
+	nReduce int,
+	phase jobPhase,
+	registerChan chan string,
+) {
+	var workers = RegisteredWorkers{workers: make(map[string]bool)}
+	var waitGroup sync.WaitGroup
+	var ntasks, nOther int
+
+	if phase == mapPhase {
+		ntasks, nOther = len(mapFiles), nReduce
+	} else {
+		ntasks, nOther = nReduce, len(mapFiles)
 	}
 
-	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
+	// Helper to start task
+	startTask := func(worker string, args *DoTaskArgs) {
+		defer waitGroup.Done()
+		result := call(worker, "Worker.DoTask", args, nil)
+		workers.setWorkerAvailable(worker)
+		log.Printf("[%s, %s Scheduler] Task %d finished with result %t\n", jobName, phase, args.TaskNumber, result)
+	}
 
-	// All ntasks tasks have to be scheduled on workers, and only once all of
-	// them have been completed successfully should the function return.
-	// Remember that workers may fail, and that any given worker may finish
-	// multiple tasks.
-	//
-	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
-	//
+	// Assign tasks to registered + available workers
+	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, nOther)
+	for currentTask := 0; currentTask < ntasks; {
+		select {
+		case worker := <-registerChan: // New worker registering, set them as available
+			workers.setWorkerAvailable(worker)
+		default: // Find available workers and assign jobs to them
+			worker, err := workers.getAvailableWorker()
+			if err == nil {
+				args := DoTaskArgs{
+					JobName:       jobName,
+					File:          mapFiles[currentTask], // Ignored for reduce phase
+					Phase:         phase,
+					TaskNumber:    currentTask,
+					NumOtherPhase: nOther,
+				}
+				waitGroup.Add(1)
+				workers.setWorkerBusy(worker)
+				currentTask++
+				go startTask(worker, &args)
+			}
+		}
+	}
+
+	// Wait for all in-flight tasks to finish
+	waitGroup.Wait()
 	fmt.Printf("Schedule: %v phase done\n", phase)
 }
