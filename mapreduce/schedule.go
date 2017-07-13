@@ -1,39 +1,10 @@
 package mapreduce
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"sync"
 )
-
-type RegisteredWorkers struct {
-	sync.Mutex
-	workers map[string]bool // worker srv -> is available?
-}
-
-func (r *RegisteredWorkers) setWorkerBusy(srv string) {
-	r.Lock()
-	defer r.Unlock()
-	r.workers[srv] = false
-}
-
-func (r *RegisteredWorkers) setWorkerAvailable(srv string) {
-	r.Lock()
-	defer r.Unlock()
-	r.workers[srv] = true
-}
-
-func (r *RegisteredWorkers) getAvailableWorker() (string, error) {
-	r.Lock()
-	defer r.Unlock()
-	for worker, isAvailable := range r.workers {
-		if isAvailable {
-			return worker, nil
-		}
-	}
-	return "", errors.New("No available workers")
-}
 
 //
 // schedule() starts and waits for all tasks in the given phase (Map
@@ -51,21 +22,22 @@ func schedule(
 	phase jobPhase,
 	registerChan chan string,
 ) {
-	var workers = RegisteredWorkers{workers: make(map[string]bool)}
 	var waitGroup sync.WaitGroup
 	var ntasks, nOther int
-
 	if phase == mapPhase {
 		ntasks, nOther = len(mapFiles), nReduce
 	} else {
 		ntasks, nOther = nReduce, len(mapFiles)
 	}
 
+	// Ready worker channel. Buffer size = number of tasks
+	readyChan := make(chan string, ntasks)
+
 	// Helper to start task
 	startTask := func(worker string, args *DoTaskArgs) {
 		defer waitGroup.Done()
 		result := call(worker, "Worker.DoTask", args, nil)
-		workers.setWorkerAvailable(worker)
+		readyChan <- worker
 		log.Printf("[%s, %s Scheduler] Task %d finished with result %t\n", jobName, phase, args.TaskNumber, result)
 	}
 
@@ -74,22 +46,18 @@ func schedule(
 	for currentTask := 0; currentTask < ntasks; {
 		select {
 		case worker := <-registerChan: // New worker registering, set them as available
-			workers.setWorkerAvailable(worker)
-		default: // Find available workers and assign jobs to them
-			worker, err := workers.getAvailableWorker()
-			if err == nil {
-				args := DoTaskArgs{
-					JobName:       jobName,
-					File:          mapFiles[currentTask], // Ignored for reduce phase
-					Phase:         phase,
-					TaskNumber:    currentTask,
-					NumOtherPhase: nOther,
-				}
-				waitGroup.Add(1)
-				workers.setWorkerBusy(worker)
-				currentTask++
-				go startTask(worker, &args)
+			readyChan <- worker
+		case worker := <-readyChan: // Worker is ready to start another task
+			args := DoTaskArgs{
+				JobName:       jobName,
+				File:          mapFiles[currentTask], // Ignored for reduce phase
+				Phase:         phase,
+				TaskNumber:    currentTask,
+				NumOtherPhase: nOther,
 			}
+			waitGroup.Add(1)
+			currentTask++
+			go startTask(worker, &args)
 		}
 	}
 
