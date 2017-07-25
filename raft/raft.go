@@ -17,8 +17,13 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
+import (
+	"math/rand"
+	"strconv"
+	"sync"
+
+	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
+)
 
 // import "bytes"
 // import "encoding/gob"
@@ -35,29 +40,39 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type ServerState int
+
+const (
+	Follower ServerState = iota
+	Candidate
+	Leader
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	sync.Mutex                     // Lock to protect shared access to this peer's state
+	peers      []*labrpc.ClientEnd // RPC end points of all peers
+	persister  *Persister          // Object to hold this peer's persisted state
+	me         int                 // this peer's index into peers[]
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	id    string
+	state ServerState
 
+	currentTerm int
+	votedFor    string // Id of candidate that has voted for, this term. Empty string if no vote has been cast.
+	leaderID    string
+
+	// TODO: Add log[]
 }
 
-// return currentTerm and whether this server
+// GetState return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.Lock()
+	defer rf.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 //
@@ -96,7 +111,9 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term        int
+	CandidateID string
+	// TODO: Last log index/term
 }
 
 //
@@ -104,14 +121,25 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int
+	voteGranted bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	rf.Lock()
+	defer rf.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		reply.voteGranted = false
+	} else if rf.votedFor == "" || args.CandidateID == rf.votedFor {
+		// TODO: Ensure candidates log is at least as up-to-date as our log
+		reply.voteGranted = true
+	}
 }
 
 //
@@ -198,6 +226,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		peers:     peers,
 		persister: persister,
 		me:        me,
+		id:        strconv.Itoa(rand.Int()), // Generating random id for this server
+		state:     Follower,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
