@@ -64,7 +64,7 @@ type Raft struct {
 	votedFor    string // Id of candidate that has voted for, this term. Empty string if no vote has been cast.
 	leaderID    string
 
-	// TODO: Add log[]
+	// TODO: Add log storage state
 }
 
 // GetState return currentTerm and whether this server
@@ -106,28 +106,22 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
+// --- RequestVote RPC ---
+
+// RequestVoteArgs - RPC arguments
 type RequestVoteArgs struct {
 	Term        int
 	CandidateID string
 	// TODO: Last log index/term
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
+// RequestVoteReply - RPC response
 type RequestVoteReply struct {
 	Term        int
-	voteGranted bool
+	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
+// RequestVote - RPC function
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
@@ -135,44 +129,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
-		reply.voteGranted = false
+		reply.VoteGranted = false
 	} else if rf.votedFor == "" || args.CandidateID == rf.votedFor {
 		// TODO: Ensure candidates log is at least as up-to-date as our log
-		reply.voteGranted = true
+		reply.VoteGranted = true
 	}
 }
 
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+// --- AppendEntries RPC ---
+
+// AppendEntriesArgs - RPC arguments
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID string
+	// TODO: Log data
+}
+
+// AppendEntriesReply - RPC response
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// AppendEntries - RPC function
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.Lock()
+	defer rf.Unlock()
+
+	// TODO: Don't just assume all entries are heartbeats
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
