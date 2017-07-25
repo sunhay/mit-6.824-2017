@@ -148,12 +148,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("Raft: [Id: %s | Term: %d | %v] - Vote requested for: %s on term: %d. Vote granted? %v", rf.id, rf.currentTerm, rf.state, args.CandidateID, args.Term, reply.VoteGranted)
 }
 
-func (rf *Raft) sendRequestVote(server int, wg *sync.WaitGroup, args *RequestVoteArgs, reply *RequestVoteReply) {
-	defer wg.Done()
+func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
 		DPrintf("Raft: [Id: %s | Term: %d | %v] - Communication error: RequestVote() RPC failed", rf.id, rf.currentTerm, rf.state)
 	}
+	voteChan <- server
 }
 
 // --- AppendEntries RPC ---
@@ -280,35 +280,36 @@ func (rf *Raft) startElection() {
 
 	args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.id}
 	resps := make([]RequestVoteReply, len(rf.peers))
-	rf.Unlock()
 
 	// Reset election timer in case of split vote / general unavailability
 	go rf.electionTimer()
 
 	// Request votes from peers
-	var wg sync.WaitGroup
+	voteChan := make(chan int, len(rf.peers))
 	for i := range rf.peers {
 		if i != rf.me {
-			wg.Add(1)
-			go rf.sendRequestVote(i, &wg, &args, &resps[i])
+			go rf.sendRequestVote(i, voteChan, &args, &resps[i])
 		}
 	}
-	wg.Wait()
+	rf.Unlock()
+
+	votes := 1
+	for i := 0; i < len(resps); i++ {
+		respIndex := <-voteChan
+		if resps[respIndex].VoteGranted {
+			votes++
+		}
+		if votes > len(resps)/2 {
+			break // We can stop counting votes once we have majority
+		}
+	}
 
 	rf.Lock()
 	defer rf.Unlock()
 
 	// Ensure that we're still a candidate and that another election did not start
 	if rf.state == Candidate && args.Term == rf.currentTerm {
-		votes := 1 // Count up votes (including self)
-		for i := range rf.peers {
-			if i != rf.me && resps[i].VoteGranted {
-				votes++
-			}
-		}
-
 		DPrintf("Raft: [Id: %s | Term: %d | %v] - Election results. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
-
 		// If majority vote, become leader
 		if votes > len(rf.peers)/2 {
 			rf.state = Leader
