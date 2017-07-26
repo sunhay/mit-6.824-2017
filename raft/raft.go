@@ -42,19 +42,23 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 
+	// General state
 	id               string
 	me               int // this peer's index into peers[]
 	state            ServerState
 	isDecommissioned bool
 
+	// Election state
 	currentTerm int
 	votedFor    string // Id of candidate that has voted for, this term. Empty string if no vote has been cast.
 	leaderID    string
 
+	// Log state
+	log         []interface{}
+	commitIndex int
+
 	lastHeartBeat time.Time // The last time that this node has recieved a heartbeat message from the Leader
 	lastEntrySent time.Time // The last time that this node has sent an entry to another node
-
-	// TODO: Add log storage state
 }
 
 // GetState return currentTerm and whether this server
@@ -63,37 +67,6 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.Lock()
 	defer rf.Unlock()
 	return rf.currentTerm, rf.state == Leader
-}
-
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
 }
 
 // --- RequestVote RPC ---
@@ -135,7 +108,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if voteChan <- server; !ok {
-		 LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: RequestVote() RPC failed", rf.id, rf.currentTerm, rf.state)
+		rf.Lock()
+		defer rf.Unlock()
+		LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: RequestVote() RPC failed", rf.id, rf.currentTerm, rf.state)
 	}
 }
 
@@ -174,6 +149,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
+		rf.Lock()
+		defer rf.Unlock()
 		LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: AppendEntries() RPC failed", rf.id, rf.currentTerm, rf.state)
 	}
 }
@@ -234,7 +211,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) startElectionTimer() {
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
-		return (500+ time.Duration(rand.Intn(100))) * time.Millisecond
+		return (500 + time.Duration(rand.Intn(100))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
@@ -282,7 +259,7 @@ func (rf *Raft) startElection() {
 	}
 
 	for i := 0; i < len(replies); i++ {
-		if replies[<- voteChan].VoteGranted {
+		if replies[<-voteChan].VoteGranted {
 			votes++
 		}
 		if hasMajorityVote() {
@@ -350,6 +327,39 @@ func (rf *Raft) sendHeartbeats() {
 		}
 	}
 	rf.lastEntrySent = time.Now()
+}
+
+// --- Persistence ---
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := gob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// data := w.Bytes()
+	// rf.persister.SaveRaftState(data)
+}
+
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+	// Your code here (2C).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := gob.NewDecoder(r)
+	// d.Decode(&rf.xxx)
+	// d.Decode(&rf.yyy)
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
 }
 
 //
