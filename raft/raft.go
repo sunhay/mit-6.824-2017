@@ -54,11 +54,23 @@ type Raft struct {
 	leaderID    string
 
 	// Log state
-	log         []interface{}
+	log         []LogEntry
 	commitIndex int
+	lastApplied int
 
-	lastHeartBeat time.Time // The last time that this node has recieved a heartbeat message from the Leader
-	lastEntrySent time.Time // The last time that this node has sent an entry to another node
+	// Leader state
+	nextIndex     []int     // For each peer, index of next log entry to send that server
+	matchIndex    []int     // For each peer, index of highest entry known log entry known to be replicated on peer
+	lastEntrySent time.Time // When this node, as Leader, last sent an entry to all nodes
+
+	// Liveness state
+	lastHeartBeat time.Time // When this node last received a heartbeat message from the Leader
+}
+
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
 }
 
 // GetState return currentTerm and whether this server
@@ -73,9 +85,10 @@ func (rf *Raft) GetState() (int, bool) {
 
 // RequestVoteArgs - RPC arguments
 type RequestVoteArgs struct {
-	Term        int
-	CandidateID string
-	// TODO: Last log index/term
+	Term         int
+	CandidateID  string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply - RPC response
@@ -118,8 +131,12 @@ func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVote
 
 // AppendEntriesArgs - RPC arguments
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderID string
+	Term             int
+	LeaderID         string
+	PreviousLogIndex int
+	PreviousLogTerm  int
+	LogEntries       []LogEntry
+	LeaderCommit     int
 }
 
 // AppendEntriesReply - RPC response
@@ -242,9 +259,8 @@ func (rf *Raft) startElection() {
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election started", rf.id, rf.currentTerm, rf.state)
 
 	// Request votes from peers
-	args := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.id}
-	replies := make([]RequestVoteReply, len(rf.peers))
-	voteChan := make(chan int, len(replies))
+	args, replies := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.id}, make([]RequestVoteReply, len(rf.peers))
+	voteChan := make(chan int, len(rf.peers))
 	for i := range rf.peers {
 		if i != rf.me {
 			go rf.sendRequestVote(i, voteChan, &args, &replies[i])
@@ -316,8 +332,7 @@ func (rf *Raft) startLeaderProcess() {
 
 func (rf *Raft) sendHeartbeats() {
 	// Heartbeat message
-	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.id}
-	replies := make([]AppendEntriesReply, len(rf.peers))
+	args, replies := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.id}, make([]AppendEntriesReply, len(rf.peers))
 
 	// Attempt to send heartbeats to all peers
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Sending heartbeats to cluster", rf.id, rf.currentTerm, rf.state)
