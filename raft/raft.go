@@ -32,6 +32,7 @@ const (
 )
 
 const HeartBeatInterval = 100 * time.Millisecond
+const CommitApplyIdleCheckInterval = 100 * time.Millisecond
 
 //
 // A Go object implementing a single Raft peer.
@@ -224,8 +225,33 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.startElectionTimer()
+	go rf.startCommitProcess(applyCh)
 
 	return rf
+}
+
+func (rf *Raft) startCommitProcess(applyChan chan ApplyMsg) {
+	rf.Lock()
+	LogInfo("Raft: [Id: %s | Term: %d | %v] - Starting commit process - Last log applied: %d", rf.id, rf.currentTerm, rf.state, rf.lastApplied)
+	rf.Unlock()
+
+	for {
+		rf.Lock()
+		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
+			entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
+			copy(entries, rf.log[rf.lastApplied+1:rf.commitIndex])
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries: [%d, %d]", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied+1, rf.commitIndex)
+			rf.Unlock()
+
+			// Hold no locks on `rf` here so that local applies don't deadlock the system
+			for _, v := range entries {
+				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+			}
+		} else {
+			rf.Unlock()
+			<-time.After(CommitApplyIdleCheckInterval)
+		}
+	}
 }
 
 func (rf *Raft) startElectionTimer() {
@@ -238,12 +264,12 @@ func (rf *Raft) startElectionTimer() {
 
 	rf.Lock()
 	defer rf.Unlock()
-
-	// Start election process if we're not a leader and the haven't recieved a heartbeat for `electionTimeout`
-	if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
-		LogInfo("Raft: [Id: %s | Term: %d | %v] - Election timer timed out. Timeout: %fs", rf.id, rf.currentTerm, rf.state, currentTimeout.Seconds())
-		go rf.startElection()
-	} else if !rf.isDecommissioned {
+	if !rf.isDecommissioned {
+		// Start election process if we're not a leader and the haven't recieved a heartbeat for `electionTimeout`
+		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Election timer timed out. Timeout: %fs", rf.id, rf.currentTerm, rf.state, currentTimeout.Seconds())
+			go rf.startElection()
+		}
 		go rf.startElectionTimer()
 	}
 }
@@ -254,9 +280,6 @@ func (rf *Raft) startElection() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.id
-
-	// Reset election timer in case of split vote / general unavailability
-	go rf.startElectionTimer()
 
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election started", rf.id, rf.currentTerm, rf.state)
 
@@ -289,7 +312,10 @@ func (rf *Raft) startElection() {
 			return
 		}
 	}
+
+	rf.Lock()
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election lost. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
+	rf.Unlock()
 }
 
 func (rf *Raft) promoteToLeader() {
@@ -343,6 +369,7 @@ func (rf *Raft) sendHeartbeats() {
 			go rf.sendAppendEntries(i, &args, &replies[i])
 		}
 	}
+
 	rf.lastEntrySent = time.Now()
 }
 
