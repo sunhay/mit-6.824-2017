@@ -209,11 +209,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		peers:     peers,
-		persister: persister,
-		me:        me,
-		id:        string(rune(me + 'A')),
-		state:     Follower,
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		id:          string(rune(me + 'A')),
+		state:       Follower,
+		commitIndex: -1,
+		lastApplied: -1,
 	}
 
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Node created", rf.id, rf.currentTerm, rf.state)
@@ -270,32 +272,24 @@ func (rf *Raft) startElection() {
 
 	// Count votes
 	votes := 1
-	hasMajorityVote := func() bool {
-		return votes > len(replies)/2
-	}
-
 	for i := 0; i < len(replies); i++ {
 		if replies[<-voteChan].VoteGranted {
 			votes++
 		}
-		if hasMajorityVote() {
-			break
+		if votes > len(replies)/2 { // Has majority vote
+			rf.Lock()
+			defer rf.Unlock()
+			// Ensure that we're still a candidate and that another election did not interrupt
+			if rf.state == Candidate && args.Term == rf.currentTerm {
+				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election won. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
+				go rf.promoteToLeader()
+			} else {
+				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election for term %d interrupted", rf.id, rf.currentTerm, rf.state, args.Term)
+			}
+			return
 		}
 	}
-
-	if hasMajorityVote() {
-		rf.Lock()
-		defer rf.Unlock()
-		// Ensure that we're still a candidate and that another election did not interrupt
-		if rf.state == Candidate && args.Term == rf.currentTerm {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Election won. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
-			go rf.promoteToLeader()
-		} else {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Election for term %d interrupted", rf.id, rf.currentTerm, rf.state, args.Term)
-		}
-	} else {
-		LogInfo("Raft: [Id: %s | Term: %d | %v] - Election lost. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
-	}
+	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election lost. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
 }
 
 func (rf *Raft) promoteToLeader() {
@@ -304,6 +298,14 @@ func (rf *Raft) promoteToLeader() {
 
 	rf.state = Leader
 	rf.leaderID = rf.id
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log) // Should be initialized to leader's last log index + 1
+		rf.matchIndex[i] = -1         // Index of highest log entry known to be replicated on server
+	}
 
 	// Send heartbeats to all peers to inform them that we're the leader
 	rf.sendHeartbeats()
