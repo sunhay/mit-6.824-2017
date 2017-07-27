@@ -33,6 +33,7 @@ const (
 
 const HeartBeatInterval = 100 * time.Millisecond
 const CommitApplyIdleCheckInterval = 100 * time.Millisecond
+const LeaderPeerTickInterval = 10 * time.Millisecond
 
 //
 // A Go object implementing a single Raft peer.
@@ -164,12 +165,84 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
+	rf.Lock()
+
+	if rf.state != Leader || rf.isDecommissioned {
+		rf.Unlock()
+		return
+	}
+
+	var entries []LogEntry = []LogEntry{}
+	var prevLogIndex, prevLogTerm int = -1, 0
+
+	peerId := string(rune(peerIndex + 'A'))
+	lastLogIndex := func() int {
+		if len(rf.log) > 0 {
+			return rf.log[len(rf.log)-1].Index
+		}
+		return -1
+	}()
+
+	if lastLogIndex >= 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
+		// Need to send logs beginning from index `rf.nextIndex[peerIndex]`
+		for i, v := range rf.log {
+			if v.Index == rf.nextIndex[peerIndex] {
+				if i > 0 {
+					lastEntry := rf.log[i-1]
+					prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+				}
+				entries = make([]LogEntry, len(rf.log)-i)
+				copy(entries, rf.log[i:])
+				break
+			}
+		}
+	} else { // We're just going to send a heartbeat
+		if len(rf.log) > 0 {
+			lastEntry := rf.log[len(rf.log)-1]
+			prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+		}
+	}
+
+	reply := AppendEntriesReply{}
+	args := AppendEntriesArgs{
+		Term:             rf.currentTerm,
+		LeaderID:         rf.id,
+		PreviousLogIndex: prevLogIndex,
+		PreviousLogTerm:  prevLogTerm,
+		LogEntries:       entries,
+		LeaderCommit:     rf.commitIndex,
+	}
+	rf.Unlock()
+
+	ok := rf.peers[peerIndex].Call("Raft.AppendEntries", &args, &reply)
+
+	rf.Lock()
+	defer rf.Unlock()
+
 	if !ok {
-		rf.Lock()
-		defer rf.Unlock()
 		LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: AppendEntries() RPC failed", rf.id, rf.currentTerm, rf.state)
+		return
+	}
+
+	if reply.Success {
+		if len(entries) > 0 {
+			lastReplicated := entries[len(entries)-1]
+			rf.matchIndex[peerIndex] = lastReplicated.Index
+			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Append of %d entries to peer: %s", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
+		} else {
+			LogDebug("Raft: [Id: %s | Term: %d | %v] - Heartbeat to peer: %s", rf.id, rf.currentTerm, rf.state, peerId)
+		}
+	} else {
+		if reply.Term > rf.currentTerm {
+			rf.state = Follower
+			rf.currentTerm = reply.Term
+		} else {
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Log deviation on peer: %s", rf.id, rf.currentTerm, rf.state, peerId)
+			rf.nextIndex[peerIndex]--    // Log deviation, we should go back an entry and see if we can correct it
+			sendAppendChan <- struct{}{} // Signal to leader-peer process that appends need to occur
+		}
 	}
 }
 
@@ -344,43 +417,36 @@ func (rf *Raft) promoteToLeader() {
 	}
 
 	// Send heartbeats to all peers to inform them that we're the leader
-	rf.sendHeartbeats()
-	go rf.startLeaderProcess()
-}
-
-func (rf *Raft) startLeaderProcess() {
-	for {
-		currentTime := <-time.After(HeartBeatInterval)
-
-		rf.Lock()
-		shouldSendHeartbeats := rf.state == Leader && currentTime.Sub(rf.lastEntrySent) >= HeartBeatInterval
-		isDecommissioned := rf.isDecommissioned
-		rf.Unlock()
-
-		// If we're leader and haven't had an entry for a while, then send liveness heartbeat
-		if _, isLeader := rf.GetState(); !isLeader || isDecommissioned {
-			break
-		} else if shouldSendHeartbeats {
-			rf.Lock()
-			rf.sendHeartbeats()
-			rf.Unlock()
-		}
-	}
-}
-
-func (rf *Raft) sendHeartbeats() {
-	// Heartbeat message
-	args, replies := AppendEntriesArgs{Term: rf.currentTerm, LeaderID: rf.id}, make([]AppendEntriesReply, len(rf.peers))
-
-	// Attempt to send heartbeats to all peers
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Sending heartbeats to cluster", rf.id, rf.currentTerm, rf.state)
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.sendAppendEntries(i, &args, &replies[i])
+			go rf.startLeaderPeerProcess(i, make(chan struct{}, 1))
 		}
 	}
+}
 
-	rf.lastEntrySent = time.Now()
+func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct{}) {
+	ticker := time.NewTicker(LeaderPeerTickInterval)
+	lastEntrySent := time.Time{}
+
+	for {
+		rf.Lock()
+		if rf.state != Leader || rf.isDecommissioned {
+			rf.Unlock()
+			break
+		}
+		rf.Unlock()
+
+		select {
+		case <-sendAppendChan: // Signal that we should send a new append to this peer
+			lastEntrySent = time.Now()
+			rf.sendAppendEntries(peerIndex, sendAppendChan)
+		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
+			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
+				lastEntrySent = time.Now()
+				rf.sendAppendEntries(peerIndex, sendAppendChan)
+			}
+		}
+	}
 }
 
 // --- Persistence ---
