@@ -187,13 +187,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	term, isLeader := rf.GetState()
 
-	// Your code here (2B).
+	if !isLeader {
+		return -1, term, isLeader
+	}
 
-	return index, term, isLeader
+	rf.Lock()
+	defer rf.Unlock()
+
+	nextIndex := func() int {
+		if len(rf.log) > 0 {
+			return len(rf.log)
+		}
+		return 0
+	}()
+	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
+
+	return nextIndex, term, isLeader
 }
 
 //
@@ -224,13 +235,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.startElectionTimer()
-	go rf.startCommitProcess(applyCh)
+	go rf.startElectionProcess()
+	go rf.startLocalApplyProcess(applyCh)
 
 	return rf
 }
 
-func (rf *Raft) startCommitProcess(applyChan chan ApplyMsg) {
+func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 	rf.Lock()
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Starting commit process - Last log applied: %d", rf.id, rf.currentTerm, rf.state, rf.lastApplied)
 	rf.Unlock()
@@ -243,8 +254,7 @@ func (rf *Raft) startCommitProcess(applyChan chan ApplyMsg) {
 			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries: [%d, %d]", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied+1, rf.commitIndex)
 			rf.Unlock()
 
-			// Hold no locks on `rf` here so that local applies don't deadlock the system
-			for _, v := range entries {
+			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
 				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
 			}
 		} else {
@@ -254,7 +264,7 @@ func (rf *Raft) startCommitProcess(applyChan chan ApplyMsg) {
 	}
 }
 
-func (rf *Raft) startElectionTimer() {
+func (rf *Raft) startElectionProcess() {
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
 		return (500 + time.Duration(rand.Intn(100))) * time.Millisecond
 	}
@@ -268,13 +278,13 @@ func (rf *Raft) startElectionTimer() {
 		// Start election process if we're not a leader and the haven't recieved a heartbeat for `electionTimeout`
 		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
 			LogInfo("Raft: [Id: %s | Term: %d | %v] - Election timer timed out. Timeout: %fs", rf.id, rf.currentTerm, rf.state, currentTimeout.Seconds())
-			go rf.startElection()
+			go rf.beginElection()
 		}
-		go rf.startElectionTimer()
+		go rf.startElectionProcess()
 	}
 }
 
-func (rf *Raft) startElection() {
+func (rf *Raft) beginElection() {
 	// Increment currentTerm and vote for self
 	rf.Lock()
 	rf.state = Candidate
