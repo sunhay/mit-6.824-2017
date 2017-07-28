@@ -77,7 +77,7 @@ type LogEntry struct {
 }
 
 func (entry LogEntry) String() string {
-	return fmt.Sprintf("LogEntry(Index: %d, Term: %d)", entry.Index, entry.Term)
+	return fmt.Sprintf("LogEntry(Index: %d, Term: %d, Command: %d)", entry.Index, entry.Term, entry.Command)
 }
 
 // GetState return currentTerm and whether this server
@@ -174,6 +174,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.Unlock()
 	reply.Term = rf.currentTerm
 
+	LogDebug("Raft: [Id: %s | Term: %d | %v] - Request from %s, w/ %d entries. Prev:[Index %d, Term %d], Log:%s", rf.id, rf.currentTerm, rf.state, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm, rf.log)
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -197,14 +199,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	logsAreEmpty := args.PreviousLogIndex == -1 && len(rf.log) == 0
-	if prevLogIndex > 0 || logsAreEmpty {
+
+	if prevLogIndex >= 0 || logsAreEmpty {
+		if len(args.LogEntries) > 0 {
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appending %d entries from %s", rf.id, rf.currentTerm, rf.state, len(args.LogEntries), args.LeaderID)
+		}
+
 		// Update existing log entries
 		entriesIndex := 0
 		for i := prevLogIndex + 1; i < len(rf.log); i++ {
 			if rf.log[i].Index == args.LogEntries[entriesIndex].Index {
 				if rf.log[i].Term != rf.log[i].Term {
-					// Delete all existing entries as they are inconsistent
-					rf.log = rf.log[:i]
+					rf.log = rf.log[:i] // Delete all existing entries as they are inconsistent
 					break
 				} else {
 					entriesIndex++
@@ -267,6 +273,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 				break
 			}
 		}
+		LogDebug("Raft: [Id: %s | Term: %d | %v] - Sending log %d entries to %s", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
 	} else { // We're just going to send a heartbeat
 		if len(rf.log) > 0 {
 			lastEntry := rf.log[len(rf.log)-1]
@@ -297,12 +304,13 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 
 	if reply.Success {
 		if len(entries) > 0 {
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appended %d entries to log of %s. Log size: %d entries", rf.id, rf.currentTerm, rf.state, len(entries), peerId, len(rf.log))
 			lastReplicated := entries[len(entries)-1]
 			rf.matchIndex[peerIndex] = lastReplicated.Index
 			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Append of %d entries to peer: %s", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
+			rf.updateCommitIndex()
 		} else {
-			LogDebug("Raft: [Id: %s | Term: %d | %v] - Heartbeat to peer: %s", rf.id, rf.currentTerm, rf.state, peerId)
+			LogDebug("Raft: [Id: %s | Term: %d | %v] - Successful heartbeat from %s", rf.id, rf.currentTerm, rf.state, peerId)
 		}
 	} else {
 		if reply.Term > rf.currentTerm {
@@ -310,9 +318,30 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			rf.currentTerm = reply.Term
 			rf.votedFor = ""
 		} else {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s, term: %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term)
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s, term: %d, nextIndex: %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term, rf.nextIndex[peerIndex])
 			rf.nextIndex[peerIndex]--    // Log deviation, we should go back an entry and see if we can correct it
 			sendAppendChan <- struct{}{} // Signal to leader-peer process that appends need to occur
+		}
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	for _, v := range rf.log {
+		// We can only increment commit index if our larger entry is for the current term
+		if v.Term == rf.currentTerm && v.Index > rf.commitIndex {
+			// Check to see if majority of nodes have replicated this
+			replicationCount := 1
+			for j := range rf.peers {
+				if j != rf.me {
+					if rf.matchIndex[j] >= v.Index {
+						if replicationCount++; replicationCount > len(rf.peers)/2 {
+							LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index: [%d -> %d], Replication: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+							// Set index of this entry as new commit index
+							rf.commitIndex = v.Index
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -348,12 +377,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}()
 
 	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
-	LogDebug("Raft: [Id: %s | Term: %d | %v] - Locally applied %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex])
 
-	// Kick off appendEntries calls to every peer
-	for i := range rf.peers {
-		rf.sendAppendChan[i] <- struct{}{}
-	}
+	LogInfo("Raft: [Id: %s | Term: %d | %v] - New entry appended to leader's log: %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex])
 
 	return nextIndex, term, isLeader
 }
@@ -399,15 +424,21 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 	for {
 		rf.Lock()
+
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
 			entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
-			copy(entries, rf.log[rf.lastApplied+1:rf.commitIndex])
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries: [%d, %d]", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied+1, rf.commitIndex)
+			copy(entries, rf.log[rf.lastApplied+1:rf.commitIndex+1])
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries. lastApplied: %d. commitIndex: %d]", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied, rf.commitIndex)
 			rf.Unlock()
 
 			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
+				LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying log: %s", rf.id, rf.currentTerm, rf.state, v)
 				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
 			}
+
+			rf.Lock()
+			rf.lastApplied += len(entries)
+			rf.Unlock()
 		} else {
 			rf.Unlock()
 			<-time.After(CommitApplyIdleCheckInterval)
