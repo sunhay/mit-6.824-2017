@@ -18,3 +18,8 @@ func LogDebug(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func LogFatal(format string, a ...interface{}) (n int, err error) {
+	log.Printf("[FATAL] "+format, a...)
+	return
+}

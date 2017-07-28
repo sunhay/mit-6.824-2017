@@ -175,7 +175,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.Unlock()
 	reply.Term = rf.currentTerm
 
-	LogDebug("Raft: [Id: %s | Term: %d | %v] - Request from %s, w/ %d entries. Prev:[Index %d, Term %d], Log:%s", rf.id, rf.currentTerm, rf.state, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm, rf.log)
+	LogDebug("Raft: [Id: %s | Term: %d | %v] - Request from %s, w/ %d entries. Prev:[Index %d, Term %d]", rf.id, rf.currentTerm, rf.state, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -191,6 +191,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.lastHeartBeat = time.Now()
 	}
 
+	// Try to find supplied previous log entry match in our log
 	prevLogIndex := -1
 	for i, v := range rf.log {
 		if v.Index == args.PreviousLogIndex && v.Term == args.PreviousLogTerm {
@@ -199,9 +200,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	logsAreEmpty := args.PreviousLogIndex == 0 && len(rf.log) == 0
-
-	if prevLogIndex >= 0 || logsAreEmpty {
+	prevEntryIsNil := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
+	if prevLogIndex >= 0 || prevEntryIsNil {
 		if len(args.LogEntries) > 0 {
 			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appending %d entries from %s", rf.id, rf.currentTerm, rf.state, len(args.LogEntries), args.LeaderID)
 		}
@@ -209,17 +209,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Update existing log entries
 		entriesIndex := 0
 		for i := prevLogIndex + 1; i < len(rf.log); i++ {
-			// TODO: Confirm this logic is right
-			if entriesIndex < len(args.LogEntries) && rf.log[i].Index == args.LogEntries[entriesIndex].Index {
-				if rf.log[i].Term != rf.log[i].Term {
-					rf.log = rf.log[:i] // Delete all existing entries as they are inconsistent
-					break
-				} else {
-					entriesIndex++
-				}
+			entryInconsistent := func() bool {
+				return rf.log[i].Index == args.LogEntries[entriesIndex].Index && rf.log[i].Term != args.LogEntries[entriesIndex].Term
+			}
+
+			if entriesIndex >= len(args.LogEntries) || entryInconsistent() {
+				// Our log is longer than our leaders, so additional entries must be inconsistent
+				rf.log = rf.log[:i]
+				break
 			} else {
-				LogInfo("Raft: [Id: %s | Term: %d | %v] - AppendEntries entry index match failure. That isn't good!", rf.id, rf.currentTerm, rf.state)
-				return
+				entriesIndex++
 			}
 		}
 
@@ -255,16 +254,10 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	var prevLogIndex, prevLogTerm int = 0, 0
 
 	peerId := string(rune(peerIndex + 'A'))
-	lastLogIndex := func() int {
-		if len(rf.log) > 0 {
-			return rf.log[len(rf.log)-1].Index
-		}
-		return 0
-	}()
+	lastLogIndex, _ := rf.getLastEntryInfo()
 
 	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
-		// Need to send logs beginning from index `rf.nextIndex[peerIndex]`
-		for i, v := range rf.log {
+		for i, v := range rf.log { // Need to send logs beginning from index `rf.nextIndex[peerIndex]`
 			if v.Index == rf.nextIndex[peerIndex] {
 				if i > 0 {
 					lastEntry := rf.log[i-1]
@@ -306,7 +299,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 
 	if reply.Success {
 		if len(entries) > 0 {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appended %d entries to log of %s. Log size: %d entries", rf.id, rf.currentTerm, rf.state, len(entries), peerId, len(rf.log))
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appended %d entries to %s's log", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
 			lastReplicated := entries[len(entries)-1]
 			rf.matchIndex[peerIndex] = lastReplicated.Index
 			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
@@ -319,10 +312,13 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			rf.state = Follower
 			rf.currentTerm = reply.Term
 			rf.votedFor = ""
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Switching to follower as %s's term is %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term)
 		} else {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s, term: %d, nextIndex: %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term, rf.nextIndex[peerIndex])
-			rf.nextIndex[peerIndex]--    // Log deviation, we should go back an entry and see if we can correct it
-			sendAppendChan <- struct{}{} // Signal to leader-peer process that appends need to occur
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s with term: %d, nextIndex: %d, args.Prev[index: %d, term: %d]", rf.id, rf.currentTerm, rf.state, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm)
+			if rf.nextIndex[peerIndex] >= 0 { // Log deviation, we should go back an entry and see if we can correct it
+				rf.nextIndex[peerIndex]--
+			}
+			sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
 		}
 	}
 }
@@ -337,7 +333,7 @@ func (rf *Raft) updateCommitIndex() {
 				if j != rf.me {
 					if rf.matchIndex[j] >= v.Index {
 						if replicationCount++; replicationCount > len(rf.peers)/2 {
-							LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index: [%d -> %d], Replication: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+							LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index [%d -> %d] with replication factor: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
 							// Set index of this entry as new commit index
 							rf.commitIndex = v.Index
 						}
@@ -502,7 +498,6 @@ func (rf *Raft) beginElection() {
 		}
 		if votes > len(replies)/2 { // Has majority vote
 			rf.Lock()
-			defer rf.Unlock()
 			// Ensure that we're still a candidate and that another election did not interrupt
 			if rf.state == Candidate && args.Term == rf.currentTerm {
 				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election won. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
@@ -510,6 +505,7 @@ func (rf *Raft) beginElection() {
 			} else {
 				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election for term %d interrupted", rf.id, rf.currentTerm, rf.state, args.Term)
 			}
+			rf.Unlock()
 			return
 		}
 	}
@@ -533,7 +529,7 @@ func (rf *Raft) promoteToLeader() {
 	for i := range rf.peers {
 		if i != rf.me {
 			rf.nextIndex[i] = len(rf.log) + 1 // Should be initialized to leader's last log index + 1
-			rf.matchIndex[i] = 0              // Index of hiqhest log entry known to be replicated on server
+			rf.matchIndex[i] = 0              // Index of highest log entry known to be replicated on server
 			rf.sendAppendChan[i] = make(chan struct{}, 1)
 
 			// Start routines for each peer which will be used to monitor and send log entries
