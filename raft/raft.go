@@ -200,21 +200,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	prevEntryIsNil := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
-	if prevLogIndex >= 0 || prevEntryIsNil {
+	isFirstEntry := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
+	if prevLogIndex >= 0 || isFirstEntry {
 		if len(args.LogEntries) > 0 {
 			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appending %d entries from %s", rf.id, rf.currentTerm, rf.state, len(args.LogEntries), args.LeaderID)
 		}
 
-		// Update existing log entries
+		// Remove any inconsistent logs and find the index of the last consistent entry from the leader
 		entriesIndex := 0
 		for i := prevLogIndex + 1; i < len(rf.log); i++ {
-			entryInconsistent := func() bool {
-				return rf.log[i].Index == args.LogEntries[entriesIndex].Index && rf.log[i].Term != args.LogEntries[entriesIndex].Term
+			entryConsistent := func() bool {
+				localEntry, leadersEntry := rf.log[i], args.LogEntries[entriesIndex]
+				return localEntry.Index == leadersEntry.Index && localEntry.Term == leadersEntry.Term
 			}
-
-			if entriesIndex >= len(args.LogEntries) || entryInconsistent() {
-				// Our log is longer than our leaders, so additional entries must be inconsistent
+			if entriesIndex >= len(args.LogEntries) || !entryConsistent() {
+				// Additional entries must be inconsistent, so let's delete them from our local log
 				rf.log = rf.log[:i]
 				break
 			} else {
@@ -222,12 +222,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 
-		// Append new entries that are not already in log
+		// Append all entries that are not already in our log
 		if entriesIndex < len(args.LogEntries) {
 			rf.log = append(rf.log, args.LogEntries[entriesIndex:]...)
 		}
 
-		// Update commit index
+		// Update the commit index
 		if args.LeaderCommit > rf.commitIndex {
 			latestLogIndex := rf.log[len(rf.log)-1].Index
 			if args.LeaderCommit < latestLogIndex {
@@ -324,19 +324,15 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 }
 
 func (rf *Raft) updateCommitIndex() {
+	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 	for _, v := range rf.log {
-		// We can only increment commit index if our larger entry is for the current term
 		if v.Term == rf.currentTerm && v.Index > rf.commitIndex {
-			// Check to see if majority of nodes have replicated this
 			replicationCount := 1
 			for j := range rf.peers {
-				if j != rf.me {
-					if rf.matchIndex[j] >= v.Index {
-						if replicationCount++; replicationCount > len(rf.peers)/2 {
-							LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index [%d -> %d] with replication factor: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
-							// Set index of this entry as new commit index
-							rf.commitIndex = v.Index
-						}
+				if j != rf.me && rf.matchIndex[j] >= v.Index {
+					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
+						LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index [%d -> %d] with replication factor: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+						rf.commitIndex = v.Index // Set index of this entry as new commit index
 					}
 				}
 			}
