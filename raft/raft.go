@@ -325,17 +325,20 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 
 func (rf *Raft) updateCommitIndex() {
 	// §5.3/5.4: If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
-	for _, v := range rf.log {
-		if v.Term == rf.currentTerm && v.Index > rf.commitIndex {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if v := rf.log[i]; v.Term == rf.currentTerm && v.Index > rf.commitIndex {
 			replicationCount := 1
 			for j := range rf.peers {
 				if j != rf.me && rf.matchIndex[j] >= v.Index {
 					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						RaftInfo("Updating commit index [%d -> %d] with replication factor: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+						RaftInfo("Updating commit index [%d -> %d] as replication factor is minimally: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
 						rf.commitIndex = v.Index // Set index of this entry as new commit index
+						break
 					}
 				}
 			}
+		} else {
+			break
 		}
 	}
 }
@@ -426,7 +429,7 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 			rf.Unlock()
 
 			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
-				RaftInfo("Locally applying log: %s", rf, v)
+				RaftDebug("Locally applying log: %s", rf, v)
 				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
 			}
 
