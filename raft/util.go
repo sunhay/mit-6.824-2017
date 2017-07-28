@@ -3,7 +3,7 @@ package raft
 import "log"
 
 // Debugging
-const Debug = 1
+const Debug = 2
 
 func LogInfo(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {

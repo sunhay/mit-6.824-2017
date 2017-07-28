@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"fmt"
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
 )
 
@@ -61,9 +62,9 @@ type Raft struct {
 	lastApplied int
 
 	// Leader state
-	nextIndex     []int     // For each peer, index of next log entry to send that server
-	matchIndex    []int     // For each peer, index of highest entry known log entry known to be replicated on peer
-	lastEntrySent time.Time // When this node, as Leader, last sent an entry to all nodes
+	nextIndex      []int // For each peer, index of next log entry to send that server
+	matchIndex     []int // For each peer, index of highest entry known log entry known to be replicated on peer
+	sendAppendChan []chan struct{}
 
 	// Liveness state
 	lastHeartBeat time.Time // When this node last received a heartbeat message from the Leader
@@ -73,6 +74,10 @@ type LogEntry struct {
 	Index   int
 	Term    int
 	Command interface{}
+}
+
+func (entry LogEntry) String() string {
+	return fmt.Sprintf("LogEntry(Index: %d, Term: %d)", entry.Index, entry.Term)
 }
 
 // GetState return currentTerm and whether this server
@@ -104,6 +109,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
 
+	lastIndex, lastTerm := func() (int, int) {
+		if len(rf.log) > 0 {
+			entry := rf.log[len(rf.log)-1]
+			return entry.Index, entry.Term
+		}
+		return -1, 0
+	}()
+
+	logIsUpToDate := func() bool {
+		if lastTerm == args.LastLogTerm {
+			return lastIndex >= args.LastLogIndex
+		}
+		return lastTerm > args.LastLogTerm
+	}()
+
+	reply.Term = rf.currentTerm
+
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 	} else if args.Term > rf.currentTerm {
@@ -111,11 +133,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
-	} else if rf.votedFor == "" || args.CandidateID == rf.votedFor { // TODO: Ensure candidates log is at least as up-to-date as our log
+	} else if (rf.votedFor == "" || args.CandidateID == rf.votedFor) && logIsUpToDate {
 		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
 	}
-	reply.Term = rf.currentTerm
 
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Vote requested for: %s on term: %d. Vote granted? %v", rf.id, rf.currentTerm, rf.state, args.CandidateID, args.Term, reply.VoteGranted)
 }
@@ -151,18 +172,67 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
+	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
-	} else if args.Term >= rf.currentTerm { // Become follower
+		return
+	} else if args.Term >= rf.currentTerm {
 		rf.state = Follower
 		rf.leaderID = args.LeaderID
 		rf.currentTerm = args.Term
-		rf.lastHeartBeat = time.Now()
 		rf.votedFor = ""
-		reply.Success = true
 	}
-	reply.Term = rf.currentTerm
+
+	if rf.leaderID == args.LeaderID {
+		rf.lastHeartBeat = time.Now()
+	}
+
+	prevLogIndex := -1
+	for i, v := range rf.log {
+		if v.Index == args.PreviousLogIndex && v.Term == args.PreviousLogTerm {
+			prevLogIndex = i
+			break
+		}
+	}
+
+	logsAreEmpty := args.PreviousLogIndex == -1 && len(rf.log) == 0
+	if prevLogIndex > 0 || logsAreEmpty {
+		// Update existing log entries
+		entriesIndex := 0
+		for i := prevLogIndex + 1; i < len(rf.log); i++ {
+			if rf.log[i].Index == args.LogEntries[entriesIndex].Index {
+				if rf.log[i].Term != rf.log[i].Term {
+					// Delete all existing entries as they are inconsistent
+					rf.log = rf.log[:i]
+					break
+				} else {
+					entriesIndex++
+				}
+			} else {
+				LogInfo("Raft: [Id: %s | Term: %d | %v] - AppendEntries entry index match failure. That isn't good!", rf.id, rf.currentTerm, rf.state)
+				return
+			}
+		}
+
+		// Append new entries that are not already in log
+		if entriesIndex < len(args.LogEntries) {
+			rf.log = append(rf.log, args.LogEntries[entriesIndex:]...)
+		}
+
+		// Update commit index
+		if args.LeaderCommit > rf.commitIndex {
+			latestLogIndex := rf.log[len(rf.log)-1].Index
+			if args.LeaderCommit < latestLogIndex {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = latestLogIndex
+			}
+		}
+		reply.Success = true
+	} else {
+		reply.Success = false
+	}
 }
 
 func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
@@ -238,8 +308,9 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 		if reply.Term > rf.currentTerm {
 			rf.state = Follower
 			rf.currentTerm = reply.Term
+			rf.votedFor = ""
 		} else {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Log deviation on peer: %s", rf.id, rf.currentTerm, rf.state, peerId)
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s, term: %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term)
 			rf.nextIndex[peerIndex]--    // Log deviation, we should go back an entry and see if we can correct it
 			sendAppendChan <- struct{}{} // Signal to leader-peer process that appends need to occur
 		}
@@ -275,7 +346,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		}
 		return 0
 	}()
+
 	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
+	LogDebug("Raft: [Id: %s | Term: %d | %v] - Locally applied %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex])
+
+	// Kick off appendEntries calls to every peer
+	for i := range rf.peers {
+		rf.sendAppendChan[i] <- struct{}{}
+	}
 
 	return nextIndex, term, isLeader
 }
@@ -410,27 +488,31 @@ func (rf *Raft) promoteToLeader() {
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.sendAppendChan = make([]chan struct{}, len(rf.peers))
 
-	for i := range rf.peers {
-		rf.nextIndex[i] = len(rf.log) // Should be initialized to leader's last log index + 1
-		rf.matchIndex[i] = -1         // Index of highest log entry known to be replicated on server
-	}
-
-	// Send heartbeats to all peers to inform them that we're the leader
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.startLeaderPeerProcess(i, make(chan struct{}, 1))
+			rf.nextIndex[i] = len(rf.log) // Should be initialized to leader's last log index + 1
+			rf.matchIndex[i] = -1         // Index of hiqhest log entry known to be replicated on server
+			rf.sendAppendChan[i] = make(chan struct{}, 1)
+
+			// Start routines for each peer which will be used to monitor and send log entries
+			go rf.startLeaderPeerProcess(i, rf.sendAppendChan[i])
 		}
 	}
 }
 
 func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct{}) {
 	ticker := time.NewTicker(LeaderPeerTickInterval)
-	lastEntrySent := time.Time{}
+
+	// Initial heartbeat
+	rf.sendAppendEntries(peerIndex, sendAppendChan)
+	lastEntrySent := time.Now()
 
 	for {
 		rf.Lock()
 		if rf.state != Leader || rf.isDecommissioned {
+			ticker.Stop()
 			rf.Unlock()
 			break
 		}
