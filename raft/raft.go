@@ -139,7 +139,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 	}
 
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Vote requested for: %s on term: %d. Vote granted? %v", rf.id, rf.currentTerm, rf.state, args.CandidateID, args.Term, reply.VoteGranted)
+	RaftInfo("Vote requested for: %s on term: %d. Vote granted? %v", rf, args.CandidateID, args.Term, reply.VoteGranted)
 }
 
 func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -147,7 +147,7 @@ func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVote
 	if voteChan <- server; !ok {
 		rf.Lock()
 		defer rf.Unlock()
-		LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: RequestVote() RPC failed", rf.id, rf.currentTerm, rf.state)
+		RaftDebug("Communication error: RequestVote() RPC failed", rf)
 	}
 }
 
@@ -175,7 +175,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.Unlock()
 	reply.Term = rf.currentTerm
 
-	LogDebug("Raft: [Id: %s | Term: %d | %v] - Request from %s, w/ %d entries. Prev:[Index %d, Term %d]", rf.id, rf.currentTerm, rf.state, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
+	RaftDebug("Request from %s, w/ %d entries. Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -203,7 +203,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	isFirstEntry := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
 	if prevLogIndex >= 0 || isFirstEntry {
 		if len(args.LogEntries) > 0 {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appending %d entries from %s", rf.id, rf.currentTerm, rf.state, len(args.LogEntries), args.LeaderID)
+			RaftInfo("Appending %d entries from %s", rf, len(args.LogEntries), args.LeaderID)
 		}
 
 		// Remove any inconsistent logs and find the index of the last consistent entry from the leader
@@ -268,7 +268,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 				break
 			}
 		}
-		LogDebug("Raft: [Id: %s | Term: %d | %v] - Sending log %d entries to %s", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
+		RaftDebug("Sending log %d entries to %s", rf, len(entries), peerId)
 	} else { // We're just going to send a heartbeat
 		if len(rf.log) > 0 {
 			lastEntry := rf.log[len(rf.log)-1]
@@ -293,28 +293,28 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	defer rf.Unlock()
 
 	if !ok {
-		LogDebug("Raft: [Id: %s | Term: %d | %v] - Communication error: AppendEntries() RPC failed", rf.id, rf.currentTerm, rf.state)
+		RaftDebug("Communication error: AppendEntries() RPC failed", rf)
 		return
 	}
 
 	if reply.Success {
 		if len(entries) > 0 {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Appended %d entries to %s's log", rf.id, rf.currentTerm, rf.state, len(entries), peerId)
+			RaftInfo("Appended %d entries to %s's log", rf, len(entries), peerId)
 			lastReplicated := entries[len(entries)-1]
 			rf.matchIndex[peerIndex] = lastReplicated.Index
 			rf.nextIndex[peerIndex] = lastReplicated.Index + 1
 			rf.updateCommitIndex()
 		} else {
-			LogDebug("Raft: [Id: %s | Term: %d | %v] - Successful heartbeat from %s", rf.id, rf.currentTerm, rf.state, peerId)
+			RaftDebug("Successful heartbeat from %s", rf, peerId)
 		}
 	} else {
 		if reply.Term > rf.currentTerm {
 			rf.state = Follower
 			rf.currentTerm = reply.Term
 			rf.votedFor = ""
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Switching to follower as %s's term is %d", rf.id, rf.currentTerm, rf.state, peerId, reply.Term)
+			RaftInfo("Switching to follower as %s's term is %d", rf, peerId, reply.Term)
 		} else {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Deviation on peer: %s with term: %d, nextIndex: %d, args.Prev[index: %d, term: %d]", rf.id, rf.currentTerm, rf.state, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm)
+			RaftInfo("Deviation on peer: %s with term: %d, nextIndex: %d, args.Prev[index: %d, term: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm)
 			if rf.nextIndex[peerIndex] >= 0 { // Log deviation, we should go back an entry and see if we can correct it
 				rf.nextIndex[peerIndex]--
 			}
@@ -331,7 +331,7 @@ func (rf *Raft) updateCommitIndex() {
 			for j := range rf.peers {
 				if j != rf.me && rf.matchIndex[j] >= v.Index {
 					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						LogInfo("Raft: [Id: %s | Term: %d | %v] - Updating commit index [%d -> %d] with replication factor: %d/%d", rf.id, rf.currentTerm, rf.state, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+						RaftInfo("Updating commit index [%d -> %d] with replication factor: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
 						rf.commitIndex = v.Index // Set index of this entry as new commit index
 					}
 				}
@@ -372,7 +372,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
 
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - New entry appended to leader's log: %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex-1])
+	RaftInfo("New entry appended to leader's log: %s", rf, rf.log[nextIndex-1])
 
 	return nextIndex, term, isLeader
 }
@@ -400,7 +400,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied: 0,
 	}
 
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Node created", rf.id, rf.currentTerm, rf.state)
+	RaftInfo("Node created", rf)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -413,7 +413,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 	rf.Lock()
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Starting commit process - Last log applied: %d", rf.id, rf.currentTerm, rf.state, rf.lastApplied)
+	RaftInfo("Starting commit process - Last log applied: %d", rf, rf.lastApplied)
 	rf.Unlock()
 
 	for {
@@ -422,11 +422,11 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
 			entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
 			copy(entries, rf.log[rf.lastApplied:rf.commitIndex])
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied, rf.commitIndex)
+			RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
 			rf.Unlock()
 
 			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
-				LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying log: %s", rf.id, rf.currentTerm, rf.state, v)
+				RaftInfo("Locally applying log: %s", rf, v)
 				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
 			}
 
@@ -453,7 +453,7 @@ func (rf *Raft) startElectionProcess() {
 	if !rf.isDecommissioned {
 		// Start election process if we're not a leader and the haven't recieved a heartbeat for `electionTimeout`
 		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Election timer timed out. Timeout: %fs", rf.id, rf.currentTerm, rf.state, currentTimeout.Seconds())
+			RaftInfo("Election timer timed out. Timeout: %fs", rf, currentTimeout.Seconds())
 			go rf.beginElection()
 		}
 		go rf.startElectionProcess()
@@ -467,7 +467,7 @@ func (rf *Raft) beginElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.id
 
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election started", rf.id, rf.currentTerm, rf.state)
+	RaftInfo("Election started", rf)
 
 	// Request votes from peers
 	lastIndex, lastTerm := rf.getLastEntryInfo()
@@ -496,10 +496,10 @@ func (rf *Raft) beginElection() {
 			rf.Lock()
 			// Ensure that we're still a candidate and that another election did not interrupt
 			if rf.state == Candidate && args.Term == rf.currentTerm {
-				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election won. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
+				RaftInfo("Election won. Vote: %d/%d", rf, votes, len(rf.peers))
 				go rf.promoteToLeader()
 			} else {
-				LogInfo("Raft: [Id: %s | Term: %d | %v] - Election for term %d interrupted", rf.id, rf.currentTerm, rf.state, args.Term)
+				RaftInfo("Election for term %d interrupted", rf, args.Term)
 			}
 			rf.Unlock()
 			return
@@ -507,7 +507,7 @@ func (rf *Raft) beginElection() {
 	}
 
 	rf.Lock()
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election lost. Vote: %d/%d", rf.id, rf.currentTerm, rf.state, votes, len(rf.peers))
+	RaftInfo("Election lost. Vote: %d/%d", rf, votes, len(rf.peers))
 	rf.Unlock()
 }
 
@@ -607,5 +607,5 @@ func (rf *Raft) Kill() {
 	defer rf.Unlock()
 
 	rf.isDecommissioned = true
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - Node killed", rf.id, rf.currentTerm, rf.state)
+	RaftInfo("Node killed", rf)
 }

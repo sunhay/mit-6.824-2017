@@ -5,21 +5,18 @@ import "log"
 // Debugging
 const Debug = 1
 
-func LogInfo(format string, a ...interface{}) (n int, err error) {
+func RaftInfo(format string, rf *Raft, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf("[INFO] "+format, a...)
+		args := append([]interface{}{rf.id, rf.currentTerm, rf.state}, a...)
+		log.Printf("[INFO] Raft: [Id: %s | Term: %d | %v] "+format, args...)
 	}
 	return
 }
 
-func LogDebug(format string, a ...interface{}) (n int, err error) {
+func RaftDebug(format string, rf *Raft, a ...interface{}) (n int, err error) {
 	if Debug > 1 {
-		log.Printf("[DEBUG] "+format, a...)
+		args := append([]interface{}{rf.id, rf.currentTerm, rf.state}, a...)
+		log.Printf("[DEBUG] Raft: [Id: %s | Term: %d | %v] "+format, args...)
 	}
-	return
-}
-
-func LogFatal(format string, a ...interface{}) (n int, err error) {
-	log.Printf("[FATAL] "+format, a...)
 	return
 }
