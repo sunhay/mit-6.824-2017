@@ -88,6 +88,14 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
+func (rf *Raft) getLastEntryInfo() (int, int) {
+	if len(rf.log) > 0 {
+		entry := rf.log[len(rf.log)-1]
+		return entry.Index, entry.Term
+	}
+	return 0, 0
+}
+
 // --- RequestVote RPC ---
 
 // RequestVoteArgs - RPC arguments
@@ -109,15 +117,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
 
-	lastIndex, lastTerm := func() (int, int) {
-		if len(rf.log) > 0 {
-			entry := rf.log[len(rf.log)-1]
-			return entry.Index, entry.Term
-		}
-		return 0, 0
-	}()
-
-	logIsUpToDate := func() bool {
+	lastIndex, lastTerm := rf.getLastEntryInfo()
+	logUpToDate := func() bool {
 		if lastTerm == args.LastLogTerm {
 			return lastIndex <= args.LastLogIndex
 		}
@@ -128,12 +129,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm && logIsUpToDate {
+	} else if args.Term > rf.currentTerm && logUpToDate {
 		rf.state = Follower
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
-	} else if (rf.votedFor == "" || args.CandidateID == rf.votedFor) && logIsUpToDate {
+	} else if (rf.votedFor == "" || args.CandidateID == rf.votedFor) && logUpToDate {
 		rf.votedFor = args.CandidateID
 		reply.VoteGranted = true
 	}
@@ -477,7 +478,14 @@ func (rf *Raft) beginElection() {
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Election started", rf.id, rf.currentTerm, rf.state)
 
 	// Request votes from peers
-	args, replies := RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.id}, make([]RequestVoteReply, len(rf.peers))
+	lastIndex, lastTerm := rf.getLastEntryInfo()
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.id,
+		LastLogTerm:  lastTerm,
+		LastLogIndex: lastIndex,
+	}
+	replies := make([]RequestVoteReply, len(rf.peers))
 	voteChan := make(chan int, len(rf.peers))
 	for i := range rf.peers {
 		if i != rf.me {
