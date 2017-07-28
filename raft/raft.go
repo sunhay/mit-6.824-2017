@@ -129,7 +129,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm && logUpToDate {
+	} else if args.Term >= rf.currentTerm && logUpToDate {
 		rf.state = Follower
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
@@ -139,7 +139,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 	}
 
-	RaftInfo("Vote requested for: %s on term: %d. Vote granted? %v", rf, args.CandidateID, args.Term, reply.VoteGranted)
+	RaftInfo("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateID, args.Term, logUpToDate, reply.VoteGranted)
 }
 
 func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -294,10 +294,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 
 	if !ok {
 		RaftDebug("Communication error: AppendEntries() RPC failed", rf)
-		return
-	}
-
-	if reply.Success {
+	} else if reply.Success {
 		if len(entries) > 0 {
 			RaftInfo("Appended %d entries to %s's log", rf, len(entries), peerId)
 			lastReplicated := entries[len(entries)-1]
@@ -331,7 +328,7 @@ func (rf *Raft) updateCommitIndex() {
 			for j := range rf.peers {
 				if j != rf.me && rf.matchIndex[j] >= v.Index {
 					if replicationCount++; replicationCount > len(rf.peers)/2 { // Check to see if majority of nodes have replicated this
-						RaftInfo("Updating commit index [%d -> %d] as replication factor is minimally: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
+						RaftInfo("Updating commit index [%d -> %d] as replication factor is at least: %d/%d", rf, rf.commitIndex, v.Index, replicationCount, len(rf.peers))
 						rf.commitIndex = v.Index // Set index of this entry as new commit index
 						break
 					}
@@ -492,11 +489,21 @@ func (rf *Raft) beginElection() {
 	// Count votes
 	votes := 1
 	for i := 0; i < len(replies); i++ {
-		if replies[<-voteChan].VoteGranted {
+		reply := replies[<-voteChan]
+
+		rf.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = Follower
+			rf.votedFor = ""
+			rf.Unlock()
+			return
+		}
+
+		if reply.VoteGranted {
 			votes++
 		}
 		if votes > len(replies)/2 { // Has majority vote
-			rf.Lock()
 			// Ensure that we're still a candidate and that another election did not interrupt
 			if rf.state == Candidate && args.Term == rf.currentTerm {
 				RaftInfo("Election won. Vote: %d/%d", rf, votes, len(rf.peers))
@@ -507,11 +514,8 @@ func (rf *Raft) beginElection() {
 			rf.Unlock()
 			return
 		}
+		rf.Unlock()
 	}
-
-	rf.Lock()
-	RaftInfo("Election lost. Vote: %d/%d", rf, votes, len(rf.peers))
-	rf.Unlock()
 }
 
 func (rf *Raft) promoteToLeader() {
