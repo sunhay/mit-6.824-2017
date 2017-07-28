@@ -114,21 +114,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			entry := rf.log[len(rf.log)-1]
 			return entry.Index, entry.Term
 		}
-		return -1, 0
+		return 0, 0
 	}()
 
 	logIsUpToDate := func() bool {
 		if lastTerm == args.LastLogTerm {
-			return lastIndex >= args.LastLogIndex
+			return lastIndex <= args.LastLogIndex
 		}
-		return lastTerm > args.LastLogTerm
+		return lastTerm < args.LastLogTerm
 	}()
 
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm {
+	} else if args.Term > rf.currentTerm && logIsUpToDate {
 		rf.state = Follower
 		rf.votedFor = args.CandidateID
 		rf.currentTerm = args.Term
@@ -198,7 +198,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	logsAreEmpty := args.PreviousLogIndex == -1 && len(rf.log) == 0
+	logsAreEmpty := args.PreviousLogIndex == 0 && len(rf.log) == 0
 
 	if prevLogIndex >= 0 || logsAreEmpty {
 		if len(args.LogEntries) > 0 {
@@ -208,7 +208,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Update existing log entries
 		entriesIndex := 0
 		for i := prevLogIndex + 1; i < len(rf.log); i++ {
-			if rf.log[i].Index == args.LogEntries[entriesIndex].Index {
+			// TODO: Confirm this logic is right
+			if entriesIndex < len(args.LogEntries) && rf.log[i].Index == args.LogEntries[entriesIndex].Index {
 				if rf.log[i].Term != rf.log[i].Term {
 					rf.log = rf.log[:i] // Delete all existing entries as they are inconsistent
 					break
@@ -250,17 +251,17 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	}
 
 	var entries []LogEntry = []LogEntry{}
-	var prevLogIndex, prevLogTerm int = -1, 0
+	var prevLogIndex, prevLogTerm int = 0, 0
 
 	peerId := string(rune(peerIndex + 'A'))
 	lastLogIndex := func() int {
 		if len(rf.log) > 0 {
 			return rf.log[len(rf.log)-1].Index
 		}
-		return -1
+		return 0
 	}()
 
-	if lastLogIndex >= 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
+	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
 		// Need to send logs beginning from index `rf.nextIndex[peerIndex]`
 		for i, v := range rf.log {
 			if v.Index == rf.nextIndex[peerIndex] {
@@ -371,14 +372,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	nextIndex := func() int {
 		if len(rf.log) > 0 {
-			return len(rf.log)
+			return len(rf.log) + 1
 		}
-		return 0
+		return 1
 	}()
 
 	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
 
-	LogInfo("Raft: [Id: %s | Term: %d | %v] - New entry appended to leader's log: %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex])
+	LogInfo("Raft: [Id: %s | Term: %d | %v] - New entry appended to leader's log: %s", rf.id, rf.currentTerm, rf.state, rf.log[nextIndex-1])
 
 	return nextIndex, term, isLeader
 }
@@ -402,8 +403,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		me:          me,
 		id:          string(rune(me + 'A')),
 		state:       Follower,
-		commitIndex: -1,
-		lastApplied: -1,
+		commitIndex: 0,
+		lastApplied: 0,
 	}
 
 	LogInfo("Raft: [Id: %s | Term: %d | %v] - Node created", rf.id, rf.currentTerm, rf.state)
@@ -427,8 +428,8 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
 			entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
-			copy(entries, rf.log[rf.lastApplied+1:rf.commitIndex+1])
-			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries. lastApplied: %d. commitIndex: %d]", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied, rf.commitIndex)
+			copy(entries, rf.log[rf.lastApplied:rf.commitIndex])
+			LogInfo("Raft: [Id: %s | Term: %d | %v] - Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf.id, rf.currentTerm, rf.state, len(entries), rf.lastApplied, rf.commitIndex)
 			rf.Unlock()
 
 			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
@@ -523,8 +524,8 @@ func (rf *Raft) promoteToLeader() {
 
 	for i := range rf.peers {
 		if i != rf.me {
-			rf.nextIndex[i] = len(rf.log) // Should be initialized to leader's last log index + 1
-			rf.matchIndex[i] = -1         // Index of hiqhest log entry known to be replicated on server
+			rf.nextIndex[i] = len(rf.log) + 1 // Should be initialized to leader's last log index + 1
+			rf.matchIndex[i] = 0              // Index of hiqhest log entry known to be replicated on server
 			rf.sendAppendChan[i] = make(chan struct{}, 1)
 
 			// Start routines for each peer which will be used to monitor and send log entries
