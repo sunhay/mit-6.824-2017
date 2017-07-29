@@ -420,7 +420,7 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 func (rf *Raft) startElectionProcess() {
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
-		return (500 + time.Duration(rand.Intn(200))) * time.Millisecond
+		return (600 + time.Duration(rand.Intn(300))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
@@ -429,7 +429,7 @@ func (rf *Raft) startElectionProcess() {
 	rf.Lock()
 	defer rf.Unlock()
 	if !rf.isDecommissioned {
-		// Start election process if we're not a leader and the haven't recieved a heartbeat for `electionTimeout`
+		// Start election process if we're not a leader and the haven't received a heartbeat for `electionTimeout`
 		if rf.state != Leader && currentTime.Sub(rf.lastHeartBeat) >= currentTimeout {
 			RaftInfo("Election timer timed out. Timeout: %fs", rf, currentTimeout.Seconds())
 			go rf.beginElection()
