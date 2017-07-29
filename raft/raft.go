@@ -277,7 +277,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//	 	 conflicting entry and the first index it stores for that term.
 
 		// If there's no entry with `args.PreviousLogIndex` in our log. Set conflicting term to that of last log entry
-		if reply.ConflictingLogTerm == 0 {
+		if reply.ConflictingLogTerm == 0 && len(rf.log) > 0 {
 			reply.ConflictingLogTerm = rf.log[len(rf.log)-1].Term
 		}
 
@@ -420,7 +420,7 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 func (rf *Raft) startElectionProcess() {
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
-		return (500 + time.Duration(rand.Intn(100))) * time.Millisecond
+		return (500 + time.Duration(rand.Intn(200))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
