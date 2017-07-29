@@ -196,8 +196,10 @@ type AppendEntriesArgs struct {
 
 // AppendEntriesReply - RPC response
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                int
+	Success             bool
+	ConflictingLogTerm  int // Term of the conflicting entry, if any
+	ConflictingLogIndex int // First index of the log for the above conflicting term
 }
 
 // AppendEntries - RPC function
@@ -223,14 +225,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Try to find supplied previous log entry match in our log
 	prevLogIndex := -1
 	for i, v := range rf.log {
-		if v.Index == args.PreviousLogIndex && v.Term == args.PreviousLogTerm {
-			prevLogIndex = i
-			break
+		if v.Index == args.PreviousLogIndex {
+			if v.Term == args.PreviousLogTerm {
+				prevLogIndex = i
+				break
+			} else {
+				reply.ConflictingLogTerm = v.Term
+			}
 		}
 	}
 
-	isFirstEntry := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
-	if prevLogIndex >= 0 || isFirstEntry {
+	isBeginningOfLog := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
+	if prevLogIndex >= 0 || isBeginningOfLog {
 		if len(args.LogEntries) > 0 {
 			RaftInfo("Appending %d entries from %s", rf, len(args.LogEntries), args.LeaderID)
 		}
@@ -267,6 +273,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.Success = true
 	} else {
+		// §5.3: When rejecting an AppendEntries request, the follower can include the term of the
+		//	 	 conflicting entry and the first index it stores for that term.
+
+		// If there's no entry with `args.PreviousLogIndex` in our log. Set conflicting term to that of last log entry
+		if reply.ConflictingLogTerm == 0 {
+			reply.ConflictingLogTerm = rf.log[len(rf.log)-1].Term
+		}
+
+		for _, v := range rf.log { // Find first log index for the conflicting term
+			if v.Term == reply.ConflictingLogTerm {
+				reply.ConflictingLogIndex = v.Index
+				break
+			}
+		}
+
 		reply.Success = false
 	}
 	rf.persist()
@@ -339,10 +360,9 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			RaftInfo("Switching to follower as %s's term is %d", rf, peerId, reply.Term)
 			rf.transitionToFollower(reply.Term)
 		} else {
-			RaftInfo("Deviation on peer: %s with term: %d, nextIndex: %d, args.Prev[index: %d, term: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm)
-			if rf.nextIndex[peerIndex] >= 0 { // Log deviation, we should go back an entry and see if we can correct it
-				rf.nextIndex[peerIndex]--
-			}
+			RaftInfo("Log deviation on %s @ T: %d. nextIndex: %d, args.Prev[I: %d, T: %d], FirstConflictEntry[I: %d, T: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm, reply.ConflictingLogIndex, reply.ConflictingLogTerm)
+			// Log deviation, we should go back to `ConflictingLogIndex - 1`, lowest value for nextIndex[peerIndex] is 1.
+			rf.nextIndex[peerIndex] = Max(reply.ConflictingLogIndex-1, 1)
 			sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
 		}
 	}

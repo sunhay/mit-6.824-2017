@@ -20,3 +20,17 @@ func RaftDebug(format string, rf *Raft, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func Min(x, y int) int {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+func Max(x, y int) int {
+	if x > y {
+		return x
+	}
+	return y
+}
