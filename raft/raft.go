@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
 )
@@ -68,6 +70,13 @@ type Raft struct {
 
 	// Liveness state
 	lastHeartBeat time.Time // When this node last received a heartbeat message from the Leader
+}
+
+// RaftPersistence is persisted to the `persister`, and contains all necessary data to restart a failed node
+type RaftPersistence struct {
+	CurrentTerm int
+	Log         []LogEntry
+	VotedFor    string
 }
 
 // GetState return currentTerm and whether this server
@@ -160,6 +169,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 	}
 
+	rf.persist()
 	RaftInfo("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateID, args.Term, logUpToDate, reply.VoteGranted)
 }
 
@@ -202,10 +212,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	} else if args.Term >= rf.currentTerm {
-		rf.state = Follower
+		rf.transitionToFollower(args.Term)
 		rf.leaderID = args.LeaderID
-		rf.currentTerm = args.Term
-		rf.votedFor = ""
 	}
 
 	if rf.leaderID == args.LeaderID {
@@ -261,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = false
 	}
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
@@ -337,6 +346,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
 		}
 	}
+	rf.persist()
 }
 
 func (rf *Raft) updateCommitIndex() {
@@ -429,6 +439,7 @@ func (rf *Raft) beginElection() {
 			go rf.sendRequestVote(i, voteChan, &args, &replies[i])
 		}
 	}
+	rf.persist()
 	rf.Unlock()
 
 	// Count votes from peers as they come in
@@ -441,6 +452,7 @@ func (rf *Raft) beginElection() {
 		if reply.Term > rf.currentTerm {
 			RaftInfo("Switching to follower as %s's term is %d", rf, reply.Id, reply.Term)
 			rf.transitionToFollower(reply.Term)
+			rf.persist()
 			rf.Unlock()
 			return
 		}
@@ -453,6 +465,7 @@ func (rf *Raft) beginElection() {
 			} else {
 				RaftInfo("Election for term %d was interrupted", rf, args.Term)
 			}
+			rf.persist()
 			rf.Unlock()
 			return
 		}
@@ -559,8 +572,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
 		peers:       peers,
 		persister:   persister,
@@ -590,37 +602,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	e.Encode(RaftPersistence{CurrentTerm: rf.currentTerm, Log: rf.log, VotedFor: rf.votedFor})
+
+	data := w.Bytes()
+	RaftDebug("Persisting node data. Byte count: %d", rf, len(data))
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	obj := RaftPersistence{}
+	d.Decode(&obj)
+
+	rf.votedFor = obj.VotedFor
+	rf.currentTerm = obj.CurrentTerm
+	rf.log = obj.Log
+	RaftInfo("Loading persisted node data. Byte count: %d", rf, len(data))
 }
 
-//
-// the tester calls Kill() when a Raft instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
-//
 func (rf *Raft) Kill() {
 	rf.Lock()
 	defer rf.Unlock()
