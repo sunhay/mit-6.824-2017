@@ -474,6 +474,9 @@ func (rf *Raft) beginElection() {
 			rf.transitionToFollower(reply.Term)
 			rf.persist()
 			rf.Unlock()
+			// This node might be the most up-to-date, but straggling behind.
+			// Starting an election right away to try and catch up with the other candidates
+			go rf.beginElection()
 			return
 		}
 
