@@ -70,16 +70,6 @@ type Raft struct {
 	lastHeartBeat time.Time // When this node last received a heartbeat message from the Leader
 }
 
-type LogEntry struct {
-	Index   int
-	Term    int
-	Command interface{}
-}
-
-func (entry LogEntry) String() string {
-	return fmt.Sprintf("LogEntry(Index: %d, Term: %d, Command: %d)", entry.Index, entry.Term, entry.Command)
-}
-
 // GetState return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -96,6 +86,29 @@ func (rf *Raft) getLastEntryInfo() (int, int) {
 	return 0, 0
 }
 
+func (rf *Raft) transitionToCandidate() {
+	rf.state = Candidate
+	// Increment currentTerm and vote for self
+	rf.currentTerm++
+	rf.votedFor = rf.id
+}
+
+func (rf *Raft) transitionToFollower(newTerm int) {
+	rf.state = Follower
+	rf.currentTerm = newTerm
+	rf.votedFor = ""
+}
+
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
+func (entry LogEntry) String() string {
+	return fmt.Sprintf("LogEntry(Index: %d, Term: %d, Command: %d)", entry.Index, entry.Term, entry.Command)
+}
+
 // --- RequestVote RPC ---
 
 // RequestVoteArgs - RPC arguments
@@ -110,6 +123,14 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
+	Id          string
+}
+
+func (reply *RequestVoteReply) VoteCount() int {
+	if reply.VoteGranted {
+		return 1
+	}
+	return 0
 }
 
 // RequestVote - RPC function
@@ -126,13 +147,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}()
 
 	reply.Term = rf.currentTerm
+	reply.Id = rf.id
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 	} else if args.Term >= rf.currentTerm && logUpToDate {
-		rf.state = Follower
+		rf.transitionToFollower(args.Term)
 		rf.votedFor = args.CandidateID
-		rf.currentTerm = args.Term
 		reply.VoteGranted = true
 	} else if (rf.votedFor == "" || args.CandidateID == rf.votedFor) && logUpToDate {
 		rf.votedFor = args.CandidateID
@@ -173,10 +194,10 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	reply.Term = rf.currentTerm
 
 	RaftDebug("Request from %s, w/ %d entries. Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -306,10 +327,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 		}
 	} else {
 		if reply.Term > rf.currentTerm {
-			rf.state = Follower
-			rf.currentTerm = reply.Term
-			rf.votedFor = ""
 			RaftInfo("Switching to follower as %s's term is %d", rf, peerId, reply.Term)
+			rf.transitionToFollower(reply.Term)
 		} else {
 			RaftInfo("Deviation on peer: %s with term: %d, nextIndex: %d, args.Prev[index: %d, term: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm)
 			if rf.nextIndex[peerIndex] >= 0 { // Log deviation, we should go back an entry and see if we can correct it
@@ -338,77 +357,6 @@ func (rf *Raft) updateCommitIndex() {
 			break
 		}
 	}
-}
-
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	term, isLeader := rf.GetState()
-
-	if !isLeader {
-		return -1, term, isLeader
-	}
-
-	rf.Lock()
-	defer rf.Unlock()
-
-	nextIndex := func() int {
-		if len(rf.log) > 0 {
-			return len(rf.log) + 1
-		}
-		return 1
-	}()
-
-	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
-
-	RaftInfo("New entry appended to leader's log: %s", rf, rf.log[nextIndex-1])
-
-	return nextIndex, term, isLeader
-}
-
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{
-		peers:       peers,
-		persister:   persister,
-		me:          me,
-		id:          string(rune(me + 'A')),
-		state:       Follower,
-		commitIndex: 0,
-		lastApplied: 0,
-	}
-
-	RaftInfo("Node created", rf)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	go rf.startElectionProcess()
-	go rf.startLocalApplyProcess(applyCh)
-
-	return rf
 }
 
 func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
@@ -461,12 +409,9 @@ func (rf *Raft) startElectionProcess() {
 }
 
 func (rf *Raft) beginElection() {
-	// Increment currentTerm and vote for self
 	rf.Lock()
-	rf.state = Candidate
-	rf.currentTerm++
-	rf.votedFor = rf.id
 
+	rf.transitionToCandidate()
 	RaftInfo("Election started", rf)
 
 	// Request votes from peers
@@ -486,30 +431,27 @@ func (rf *Raft) beginElection() {
 	}
 	rf.Unlock()
 
-	// Count votes
+	// Count votes from peers as they come in
 	votes := 1
 	for i := 0; i < len(replies); i++ {
 		reply := replies[<-voteChan]
-
 		rf.Lock()
+
+		// §5.1: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.state = Follower
-			rf.votedFor = ""
+			RaftInfo("Switching to follower as %s's term is %d", rf, reply.Id, reply.Term)
+			rf.transitionToFollower(reply.Term)
 			rf.Unlock()
 			return
 		}
 
-		if reply.VoteGranted {
-			votes++
-		}
-		if votes > len(replies)/2 { // Has majority vote
+		if votes += reply.VoteCount(); votes > len(replies)/2 { // Has majority vote
 			// Ensure that we're still a candidate and that another election did not interrupt
 			if rf.state == Candidate && args.Term == rf.currentTerm {
 				RaftInfo("Election won. Vote: %d/%d", rf, votes, len(rf.peers))
 				go rf.promoteToLeader()
 			} else {
-				RaftInfo("Election for term %d interrupted", rf, args.Term)
+				RaftInfo("Election for term %d was interrupted", rf, args.Term)
 			}
 			rf.Unlock()
 			return
@@ -568,6 +510,76 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct
 			}
 		}
 	}
+}
+
+//
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	term, isLeader := rf.GetState()
+
+	if !isLeader {
+		return -1, term, isLeader
+	}
+
+	rf.Lock()
+	defer rf.Unlock()
+
+	nextIndex := func() int {
+		if len(rf.log) > 0 {
+			return len(rf.log) + 1
+		}
+		return 1
+	}()
+
+	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
+	RaftInfo("New entry appended to leader's log: %s", rf, rf.log[nextIndex-1])
+
+	return nextIndex, term, isLeader
+}
+
+//
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{
+		peers:       peers,
+		persister:   persister,
+		me:          me,
+		id:          string(rune(me + 'A')),
+		state:       Follower,
+		commitIndex: 0,
+		lastApplied: 0,
+	}
+
+	RaftInfo("Node created", rf)
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	go rf.startElectionProcess()
+	go rf.startLocalApplyProcess(applyCh)
+
+	return rf
 }
 
 // --- Persistence ---
