@@ -482,31 +482,25 @@ func (rf *Raft) beginElection() {
 		rf.Lock()
 
 		// §5.1: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-		if reply.Term > rf.currentTerm && rf.state == Candidate {
+		if reply.Term > rf.currentTerm {
 			RaftInfo("Switching to follower as %s's term is %d", rf, reply.Id, reply.Term)
 			rf.transitionToFollower(reply.Term)
-			rf.persist()
-			rf.Unlock()
-			// This node might be the most up-to-date, but straggling behind.
-			// Starting an election right away to try and catch up with the other candidates
-			go rf.beginElection()
-			return
-		}
-
-		if votes += reply.VoteCount(); votes > len(replies)/2 { // Has majority vote
+			break
+		} else if votes += reply.VoteCount(); votes > len(replies)/2 { // Has majority vote
 			// Ensure that we're still a candidate and that another election did not interrupt
 			if rf.state == Candidate && args.Term == rf.currentTerm {
 				RaftInfo("Election won. Vote: %d/%d", rf, votes, len(rf.peers))
 				go rf.promoteToLeader()
+				break
 			} else {
 				RaftInfo("Election for term %d was interrupted", rf, args.Term)
+				break
 			}
-			rf.persist()
-			rf.Unlock()
-			return
 		}
 		rf.Unlock()
 	}
+	rf.persist()
+	rf.Unlock()
 }
 
 func (rf *Raft) promoteToLeader() {
