@@ -175,11 +175,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	if voteChan <- server; !ok {
-		rf.Lock()
-		defer rf.Unlock()
-		RaftDebug("Communication error: RequestVote() RPC failed", rf)
+	requestName := "Raft.RequestVote"
+	request := func() bool {
+		return rf.peers[server].Call(requestName, args, reply)
+	}
+
+	if ok := SendRPCRequest(requestName, request); ok {
+		voteChan <- server
 	}
 }
 
@@ -294,6 +296,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 }
 
+func (rf *Raft) sendAppendEntryRequest(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	requestName := "Raft.AppendEntries"
+	request := func() bool {
+		return rf.peers[server].Call(requestName, args, reply)
+	}
+	return SendRPCRequest(requestName, request)
+}
+
 func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	rf.Lock()
 
@@ -339,7 +349,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	}
 	rf.Unlock()
 
-	ok := rf.peers[peerIndex].Call("Raft.AppendEntries", &args, &reply)
+	ok := rf.sendAppendEntryRequest(peerIndex, &args, &reply)
 
 	rf.Lock()
 	defer rf.Unlock()
@@ -363,7 +373,7 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 			RaftInfo("Switching to follower as %s's term is %d", rf, peerId, reply.Term)
 			rf.transitionToFollower(reply.Term)
 		} else {
-			RaftInfo("Log deviation on %s @ T: %d. nextIndex: %d, args.Prev[I: %d, T: %d], FirstConflictEntry[I: %d, T: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm, reply.ConflictingLogIndex, reply.ConflictingLogTerm)
+			RaftInfo("Log deviation on %s. T: %d, nextIndex: %d, args.Prev[I: %d, T: %d], FirstConflictEntry[I: %d, T: %d]", rf, peerId, reply.Term, rf.nextIndex[peerIndex], args.PreviousLogIndex, args.PreviousLogTerm, reply.ConflictingLogIndex, reply.ConflictingLogTerm)
 			// Log deviation, we should go back to `ConflictingLogIndex - 1`, lowest value for nextIndex[peerIndex] is 1.
 			rf.nextIndex[peerIndex] = Max(reply.ConflictingLogIndex-1, 1)
 			sendAppendChan <- struct{}{} // Signals to leader-peer process that appends need to occur
