@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
 )
 
@@ -35,7 +36,7 @@ const (
 )
 
 const HeartBeatInterval = 100 * time.Millisecond
-const CommitApplyIdleCheckInterval = 100 * time.Millisecond
+const CommitApplyIdleCheckInterval = 25 * time.Millisecond
 const LeaderPeerTickInterval = 10 * time.Millisecond
 
 //
@@ -345,6 +346,8 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 
 	if !ok {
 		RaftDebug("Communication error: AppendEntries() RPC failed", rf)
+	} else if rf.state != Leader || rf.isDecommissioned || args.Term != rf.currentTerm {
+		RaftInfo("Node state has changed since request was sent. Discarding response", rf)
 	} else if reply.Success {
 		if len(entries) > 0 {
 			RaftInfo("Appended %d entries to %s's log", rf, len(entries), peerId)
@@ -420,7 +423,7 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 func (rf *Raft) startElectionProcess() {
 	electionTimeout := func() time.Duration { // Randomized timeouts between [500, 600)-ms
-		return (600 + time.Duration(rand.Intn(300))) * time.Millisecond
+		return (200 + time.Duration(rand.Intn(300))) * time.Millisecond
 	}
 
 	currentTimeout := electionTimeout()
@@ -469,7 +472,7 @@ func (rf *Raft) beginElection() {
 		rf.Lock()
 
 		// §5.1: If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
-		if reply.Term > rf.currentTerm {
+		if reply.Term > rf.currentTerm && rf.state == Candidate {
 			RaftInfo("Switching to follower as %s's term is %d", rf, reply.Id, reply.Term)
 			rf.transitionToFollower(reply.Term)
 			rf.persist()
@@ -538,11 +541,11 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct
 		select {
 		case <-sendAppendChan: // Signal that we should send a new append to this peer
 			lastEntrySent = time.Now()
-			rf.sendAppendEntries(peerIndex, sendAppendChan)
+			go rf.sendAppendEntries(peerIndex, sendAppendChan)
 		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
 			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
 				lastEntrySent = time.Now()
-				rf.sendAppendEntries(peerIndex, sendAppendChan)
+				go rf.sendAppendEntries(peerIndex, sendAppendChan)
 			}
 		}
 	}
