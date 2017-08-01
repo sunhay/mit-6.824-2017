@@ -1,9 +1,8 @@
 package raftkv
 
-import "labrpc"
+import "github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
 import "crypto/rand"
 import "math/big"
-
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
