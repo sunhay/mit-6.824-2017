@@ -577,7 +577,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	nextIndex := func() int {
 		if len(rf.log) > 0 {
-			return len(rf.log) + 1
+			return rf.log[len(rf.log)-1].Index + 1
 		}
 		return 1
 	}()
