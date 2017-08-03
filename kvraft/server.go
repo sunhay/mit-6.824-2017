@@ -6,6 +6,7 @@ import (
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/raft"
 	"log"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -17,29 +18,121 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type CommandType int
+
+const (
+	Put CommandType = iota
+	Append
+	Get
+)
+
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Command CommandType
+	Value   string
+	Id      string // Request ID : TODO
 }
 
 type RaftKV struct {
-	mu      sync.Mutex
+	sync.Mutex
+
 	me      int
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	inFlight map[int]chan raft.ApplyMsg
+
+	data map[string]string
+}
+
+// Returns whether or not this was a successful request
+func (kv *RaftKV) await(index int, op Op) (success bool) {
+	kv.Lock()
+	awaitChan := make(chan raft.ApplyMsg, 1)
+	kv.inFlight[index] = awaitChan
+	kv.Unlock()
+
+	for {
+		select {
+		case message := <-awaitChan:
+			kv.Lock()
+			delete(kv.inFlight, index)
+			kv.Unlock()
+
+			if index == message.Index && op == message.Command {
+				return true
+			} else { // Must not have been the leader in the majority partition?
+				return false
+			}
+		case <-time.After(10 * time.Millisecond):
+			kv.Lock()
+			if _, stillLeader := kv.rf.GetState(); !stillLeader { // We're no longer leader. Abort
+				delete(kv.inFlight, index)
+				kv.Unlock()
+				return false
+			}
+			kv.Unlock()
+		}
+	}
+
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{Command: Get, Value: args.Key}
+
+	kv.Lock()
+	index, _, isLeader := kv.rf.Start(op)
+	kv.Unlock()
+
+	if !isLeader {
+		reply.WrongLeader = true
+	} else {
+		success := kv.await(index, op)
+		if !success { // Request likely failed due to leadership change
+			reply.WrongLeader = true
+		} else {
+			kv.Lock()
+			if val, isPresent := kv.data[args.Key]; isPresent {
+				reply.Err = OK
+				reply.Value = val
+			} else {
+				reply.Err = ErrNoKey
+			}
+			kv.Unlock()
+		}
+	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := func() Op {
+		if args.Op == "Put" {
+			return Op{Command: Put, Value: args.Value}
+		}
+		return Op{Command: Append, Value: args.Value}
+	}()
+
+	kv.Lock()
+	index, _, isLeader := kv.rf.Start(op)
+	kv.Unlock()
+
+	if !isLeader {
+		reply.WrongLeader = true
+	} else {
+		success := kv.await(index, op)
+		if !success { // Request likely failed due to leadership change
+			reply.WrongLeader = true
+		} else {
+			kv.Lock()
+			if op.Command == Put {
+				kv.data[args.Key] = args.Value
+			} else {
+				kv.data[args.Key] += args.Value
+			}
+			reply.Err = OK
+			kv.Unlock()
+		}
+	}
 }
 
 //
