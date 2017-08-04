@@ -113,7 +113,7 @@ type LogEntry struct {
 }
 
 func (entry LogEntry) String() string {
-	return fmt.Sprintf("LogEntry(Index: %d, Term: %d, Command: %d)", entry.Index, entry.Term, entry.Command)
+	return fmt.Sprintf("LogEntry(Index: %d, Term: %d)", entry.Index, entry.Term)
 }
 
 // --- RequestVote RPC ---

@@ -28,10 +28,11 @@ const (
 )
 
 type Op struct {
-	Command CommandType
-	Key     string
-	Value   string
-	Id      string // Request ID : TODO
+	Command   CommandType
+	Key       string
+	Value     string
+	RequestId int64
+	ClientId  int64
 }
 
 type RaftKV struct {
@@ -47,6 +48,7 @@ type RaftKV struct {
 
 	requestHandlers map[int]chan raft.ApplyMsg
 	data            map[string]string
+	latestRequests  map[int64]int64 // Client ID -> Last applied Request ID
 }
 
 // Returns whether or not this was a successful request
@@ -82,7 +84,7 @@ func (kv *RaftKV) await(index int, op Op) (success bool) {
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	op := Op{Command: Get, Key: args.Key}
+	op := Op{Command: Get, Key: args.Key, ClientId: args.ClerkId, RequestId: args.RequestId}
 
 	kv.Lock()
 	index, _, isLeader := kv.rf.Start(op)
@@ -111,12 +113,12 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	op := func() Op {
-		if args.Op == "Put" {
-			return Op{Command: Put, Key: args.Key, Value: args.Value}
-		}
-		return Op{Command: Append, Key: args.Key, Value: args.Value}
-	}()
+	op := Op{Key: args.Key, Value: args.Value, ClientId: args.ClerkId, RequestId: args.RequestId}
+	if args.Op == "Put" {
+		op.Command = Put
+	} else {
+		op.Command = Append
+	}
 
 	kv.Lock()
 	index, _, isLeader := kv.rf.Start(op)
@@ -144,10 +146,20 @@ func (kv *RaftKV) startApplyProcess() {
 			kv.Lock()
 
 			op := m.Command.(Op)
-			if op.Command == Put {
-				kv.data[op.Key] = op.Value
-			} else if op.Command == Append {
-				kv.data[op.Key] += op.Value
+
+			// Deduplicate write requests: Each RPC implies that the client has seen the reply for its previous RPC.
+			//                      	   It's OK to assume that a client will make only one call into a clerk at a time.
+			if op.Command != Get {
+				if requestId, isPresent := kv.latestRequests[op.ClientId]; !(isPresent && requestId == op.RequestId) {
+					if op.Command == Put {
+						kv.data[op.Key] = op.Value
+					} else if op.Command == Append {
+						kv.data[op.Key] += op.Value
+					}
+					kv.latestRequests[op.ClientId] = op.RequestId
+				} else {
+					RaftKVInfo("Write request de-duplicated for key: %s. RId: %d, CId: %d", kv, op.Key, op.RequestId, op.ClientId)
+				}
 			}
 
 			if c, isPresent := kv.requestHandlers[m.Index]; isPresent {
@@ -194,6 +206,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		maxraftstate:    maxraftstate,
 		requestHandlers: make(map[int]chan raft.ApplyMsg),
 		data:            make(map[string]string),
+		latestRequests:  make(map[int64]int64),
 		applyCh:         make(chan raft.ApplyMsg),
 	}
 

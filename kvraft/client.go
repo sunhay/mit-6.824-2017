@@ -7,6 +7,7 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 
+	id              int64
 	lastKnownLeader int
 }
 
@@ -18,7 +19,7 @@ func nrand() int64 {
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
-	ck := Clerk{servers: servers}
+	ck := Clerk{servers: servers, id: nrand()}
 	return &ck
 }
 
@@ -35,20 +36,18 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	args, reply := GetArgs{Key: key}, GetReply{}
+	args, reply := GetArgs{Key: key, RequestId: nrand(), ClerkId: ck.id}, GetReply{}
 
 	index := ck.lastKnownLeader
-	for reply.Err != OK {
+	for reply.Err != OK { // Retry until success
 		ok := ck.servers[index%len(ck.servers)].Call("RaftKV.Get", &args, &reply)
-		if ok {
-			if reply.WrongLeader { // Try next node in server list
-				index++
-			} else if reply.Err == ErrNoKey { // Return "" if key does not exist
-				return ""
-			}
+		if !ok || reply.WrongLeader {
+			index++
+		} else if reply.Err == ErrNoKey { // Return "" if key does not exist
+			return ""
 		}
 	}
-	ck.lastKnownLeader = index % len(ck.servers) // Update latest known working server
+	ck.lastKnownLeader = index % len(ck.servers) // Update latest known leader
 	return reply.Value
 }
 
@@ -63,18 +62,16 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args, reply := PutAppendArgs{Key: key, Value: value, Op: op}, PutAppendReply{}
+	args, reply := PutAppendArgs{Key: key, Value: value, Op: op, RequestId: nrand(), ClerkId: ck.id}, PutAppendReply{}
 
 	index := ck.lastKnownLeader
-	for reply.Err != OK {
+	for reply.Err != OK { // Retry until success
 		ok := ck.servers[index%len(ck.servers)].Call("RaftKV.PutAppend", &args, &reply)
-		if ok {
-			if reply.WrongLeader { // Try next node in server list
-				index++
-			}
+		if !ok || reply.WrongLeader {
+			index++
 		}
 	}
-	ck.lastKnownLeader = index % len(ck.servers) // Update latest known working server
+	ck.lastKnownLeader = index % len(ck.servers) // Update latest known leader
 }
 
 func (ck *Clerk) Put(key string, value string) {
