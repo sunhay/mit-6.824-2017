@@ -147,8 +147,9 @@ func (kv *RaftKV) startApplyProcess() {
 
 			op := m.Command.(Op)
 
-			// Deduplicate write requests: Each RPC implies that the client has seen the reply for its previous RPC.
-			//                      	   It's OK to assume that a client will make only one call into a clerk at a time.
+			// De-duplicating write requests, for "exactly-once" semantics
+			// Note: Each RPC implies that the client has seen the reply for its previous RPC. It's OK to assume that
+			// a client will make only one call into a clerk at a time.
 			if op.Command != Get {
 				if requestId, isPresent := kv.latestRequests[op.ClientId]; !(isPresent && requestId == op.RequestId) {
 					if op.Command == Put {
@@ -163,7 +164,7 @@ func (kv *RaftKV) startApplyProcess() {
 			}
 
 			if c, isPresent := kv.requestHandlers[m.Index]; isPresent {
-				c <- m // TODO: Should probably send value if Get, likely false linearizability due to race conditions
+				c <- m
 			}
 
 			kv.Unlock()
