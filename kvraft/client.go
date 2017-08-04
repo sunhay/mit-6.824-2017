@@ -6,7 +6,8 @@ import "math/big"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+
+	lastKnownLeader int
 }
 
 func nrand() int64 {
@@ -17,10 +18,8 @@ func nrand() int64 {
 }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.servers = servers
-	// You'll have to add code here.
-	return ck
+	ck := Clerk{servers: servers}
+	return &ck
 }
 
 //
@@ -36,9 +35,21 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	args, reply := GetArgs{Key: key}, GetReply{}
 
-	// You will have to modify this function.
-	return ""
+	index := ck.lastKnownLeader
+	for reply.Err != OK {
+		ok := ck.servers[index%len(ck.servers)].Call("RaftKV.Get", &args, &reply)
+		if ok {
+			if reply.WrongLeader { // Try next node in server list
+				index++
+			} else if reply.Err == ErrNoKey { // Return "" if key does not exist
+				return ""
+			}
+		}
+	}
+	ck.lastKnownLeader = index % len(ck.servers) // Update latest known working server
+	return reply.Value
 }
 
 //
@@ -52,7 +63,18 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args, reply := PutAppendArgs{Key: key, Value: value, Op: op}, PutAppendReply{}
+
+	index := ck.lastKnownLeader
+	for reply.Err != OK {
+		ok := ck.servers[index%len(ck.servers)].Call("RaftKV.PutAppend", &args, &reply)
+		if ok {
+			if reply.WrongLeader { // Try next node in server list
+				index++
+			}
+		}
+	}
+	ck.lastKnownLeader = index % len(ck.servers) // Update latest known working server
 }
 
 func (ck *Clerk) Put(key string, value string) {
