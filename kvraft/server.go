@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
 	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/raft"
@@ -9,12 +10,14 @@ import (
 	"time"
 )
 
+const AwaitLeaderCheckInterval = 10 * time.Millisecond
+const SnapshotSizeTolerancePercentage = 1
 const Debug = 1
 
-func RaftKVInfo(format string, kv *RaftKV, a ...interface{}) (n int, err error) {
+func kvInfo(format string, kv *RaftKV, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		args := append([]interface{}{kv.id, len(kv.data)}, a...)
-		log.Printf("[INFO] KV Server: [Id: %s, Size: %d] "+format, args...)
+		log.Printf("[INFO] KV Server: [Id: %s, %d keys] "+format, args...)
 	}
 	return
 }
@@ -38,17 +41,24 @@ type Op struct {
 type RaftKV struct {
 	sync.Mutex
 
-	me      int
-	id      string
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	me        int
+	id        string
+	rf        *raft.Raft
+	applyCh   chan raft.ApplyMsg
+	persister *raft.Persister
 
-	maxraftstate    int // snapshot if log grows this big
-	isDecomissioned bool
+	maxraftstate     int // snapshot if log grows this big
+	snapshotsEnabled bool
+	isDecommissioned bool
 
 	requestHandlers map[int]chan raft.ApplyMsg
 	data            map[string]string
 	latestRequests  map[int64]int64 // Client ID -> Last applied Request ID
+}
+
+type RaftKVPersistence struct {
+	Data           map[string]string
+	LatestRequests map[int64]int64
 }
 
 // Returns whether or not this was a successful request
@@ -70,7 +80,7 @@ func (kv *RaftKV) await(index int, op Op) (success bool) {
 			} else { // Message at index was not what we're expecting, must not be leader in majority partition
 				return false
 			}
-		case <-time.After(10 * time.Millisecond):
+		case <-time.After(AwaitLeaderCheckInterval):
 			kv.Lock()
 			if _, stillLeader := kv.rf.GetState(); !stillLeader { // We're no longer leader. Abort
 				delete(kv.requestHandlers, index)
@@ -80,7 +90,6 @@ func (kv *RaftKV) await(index int, op Op) (success bool) {
 			kv.Unlock()
 		}
 	}
-
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
@@ -96,15 +105,15 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		success := kv.await(index, op)
 		if !success { // Request likely failed due to leadership change
 			reply.WrongLeader = true
-			RaftKVInfo("Get(): Failed, node is no longer leader", kv)
+			kvInfo("Get(): Failed, node is no longer leader", kv)
 		} else {
 			kv.Lock()
 			if val, isPresent := kv.data[args.Key]; isPresent {
-				RaftKVInfo("Get(): Succeeded for key: %s", kv, args.Key)
+				kvInfo("Get(): Succeeded for key: %s", kv, args.Key)
 				reply.Err = OK
 				reply.Value = val
 			} else {
-				RaftKVInfo("Get(): Failed, no entry for key: %s", kv, args.Key)
+				kvInfo("Get(): Failed, no entry for key: %s", kv, args.Key)
 				reply.Err = ErrNoKey
 			}
 			kv.Unlock()
@@ -129,21 +138,27 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		success := kv.await(index, op)
 		if !success { // Request likely failed due to leadership change
-			RaftKVInfo("%s(): Failed, node is no longer leader", kv, args.Op)
+			kvInfo("%s(): Failed, node is no longer leader", kv, args.Op)
 			reply.WrongLeader = true
 		} else {
-			RaftKVInfo("%s(): Succeeded for key: %s", kv, args.Op, args.Key)
+			kvInfo("%s(): Succeeded for key: %s", kv, args.Op, args.Key)
 			reply.Err = OK
 		}
 	}
 }
 
 func (kv *RaftKV) startApplyProcess() {
-	RaftKVInfo("Starting apply process", kv)
-	for !kv.isDecomissioned {
+	kvInfo("Starting apply process", kv)
+	for !kv.isDecommissioned {
 		select {
 		case m := <-kv.applyCh:
 			kv.Lock()
+
+			if m.UseSnapshot { // ApplyMsg might be a request to load snapshot
+				kv.loadSnapshot(m.Snapshot)
+				kv.Unlock()
+				continue
+			}
 
 			op := m.Command.(Op)
 
@@ -159,7 +174,7 @@ func (kv *RaftKV) startApplyProcess() {
 					}
 					kv.latestRequests[op.ClientId] = op.RequestId
 				} else {
-					RaftKVInfo("Write request de-duplicated for key: %s. RId: %d, CId: %d", kv, op.Key, op.RequestId, op.ClientId)
+					kvInfo("Write request de-duplicated for key: %s. RId: %d, CId: %d", kv, op.Key, op.RequestId, op.ClientId)
 				}
 			}
 
@@ -167,9 +182,43 @@ func (kv *RaftKV) startApplyProcess() {
 				c <- m
 			}
 
+			// Create snapshot if log is close to reaching max size (within `SnapshotSizeTolerancePercentage`)
+			if kv.snapshotsEnabled && 1-(kv.persister.RaftStateSize()/kv.maxraftstate) >= SnapshotSizeTolerancePercentage/100 {
+				kvInfo("Creating snapshot. Raft state size: %d bytes, Max size = %d bytes", kv, kv.persister.RaftStateSize(), kv.maxraftstate)
+				kv.createSnapshot(m.Index)
+			}
+
 			kv.Unlock()
 		}
 	}
+}
+
+func (kv *RaftKV) createSnapshot(logIndex int) {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	e.Encode(RaftKVPersistence{Data: kv.data, LatestRequests: kv.latestRequests})
+
+	data := w.Bytes()
+	kvInfo("Saving snapshot. Size: %d bytes", kv, len(data))
+	kv.persister.SaveSnapshot(data)
+
+	// Compact raft log til index.
+	kv.rf.CompactLog(logIndex)
+}
+
+func (kv *RaftKV) loadSnapshot(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	obj := RaftKVPersistence{}
+	d.Decode(&obj)
+
+	kv.data = obj.Data
+	kv.latestRequests = obj.LatestRequests
+	kvInfo("Loaded snapshot. %d bytes", kv, len(data))
+
+	// Save this loaded snapshot locally
+	kv.persister.SaveSnapshot(data)
 }
 
 //
@@ -180,7 +229,7 @@ func (kv *RaftKV) startApplyProcess() {
 //
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
-	kv.isDecomissioned = true
+	kv.isDecommissioned = true
 }
 
 //
@@ -202,16 +251,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	gob.Register(Op{})
 
 	kv := RaftKV{
-		me:              me,
-		id:              string('Z' - me),
-		maxraftstate:    maxraftstate,
-		requestHandlers: make(map[int]chan raft.ApplyMsg),
-		data:            make(map[string]string),
-		latestRequests:  make(map[int64]int64),
-		applyCh:         make(chan raft.ApplyMsg),
+		me:               me,
+		id:               string('Z' - me),
+		maxraftstate:     maxraftstate,
+		snapshotsEnabled: maxraftstate != -1,
+		persister:        persister,
+		requestHandlers:  make(map[int]chan raft.ApplyMsg),
+		data:             make(map[string]string),
+		latestRequests:   make(map[int64]int64),
+		applyCh:          make(chan raft.ApplyMsg),
 	}
 
-	RaftKVInfo("Starting node", &kv)
+	kvInfo("Starting node", &kv)
+
+	if data := persister.ReadSnapshot(); kv.snapshotsEnabled && data != nil && len(data) > 0 {
+		kv.loadSnapshot(data)
+	}
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 

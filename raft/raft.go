@@ -44,9 +44,11 @@ type Raft struct {
 	leaderID    string
 
 	// Log state
-	log         []LogEntry
-	commitIndex int
-	lastApplied int
+	log               []LogEntry
+	commitIndex       int
+	lastApplied       int
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
 
 	// Leader state
 	nextIndex      []int // For each peer, index of next log entry to send that server
@@ -561,7 +563,7 @@ func (rf *Raft) persist() {
 	e.Encode(RaftPersistence{CurrentTerm: rf.currentTerm, Log: rf.log, VotedFor: rf.votedFor})
 
 	data := w.Bytes()
-	RaftDebug("Persisting node data. Byte count: %d", rf, len(data))
+	RaftDebug("Persisting node data (%d bytes)", rf, len(data))
 	rf.persister.SaveRaftState(data)
 }
 
@@ -578,10 +580,8 @@ func (rf *Raft) readPersist(data []byte) {
 	obj := RaftPersistence{}
 	d.Decode(&obj)
 
-	rf.votedFor = obj.VotedFor
-	rf.currentTerm = obj.CurrentTerm
-	rf.log = obj.Log
-	RaftInfo("Loading persisted node data. Byte count: %d", rf, len(data))
+	rf.votedFor, rf.currentTerm, rf.log = obj.VotedFor, obj.CurrentTerm, obj.Log
+	RaftInfo("Loading persisted node data (%d bytes)", rf, len(data))
 }
 
 func (rf *Raft) Kill() {
@@ -590,4 +590,23 @@ func (rf *Raft) Kill() {
 
 	rf.isDecommissioned = true
 	RaftInfo("Node killed", rf)
+}
+
+// --- Log compaction ---
+
+func (rf *Raft) CompactLog(lastLogIndex int) {
+	rf.Lock()
+
+	if lastLogIndex > rf.commitIndex {
+		RaftInfo("Failed to compact log as log index: %d is larger than commit index: %d", rf, lastLogIndex, rf.commitIndex)
+	}
+
+	for _, v := range rf.log {
+		if v.Index == lastLogIndex {
+			rf.lastSnapshotIndex = v.Index
+			rf.lastSnapshotTerm = v.Term
+		}
+	}
+
+	defer rf.Unlock()
 }
