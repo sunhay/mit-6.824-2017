@@ -39,7 +39,7 @@ type RequestVoteArgs struct {
 
 type RequestVoteReply struct {
 	Term        int
-fa	VoteGranted bool
+	VoteGranted bool
 	Id          string
 }
 
