@@ -72,7 +72,17 @@ func (rf *Raft) getLastEntryInfo() (int, int) {
 		entry := rf.log[len(rf.log)-1]
 		return entry.Index, entry.Term
 	}
-	return 0, 0
+	return rf.lastSnapshotIndex, rf.lastSnapshotTerm
+}
+
+// Returns index within `rf.log` of log entry with index `logIndex`
+func (rf *Raft) findLogIndex(logIndex int) (int, bool) {
+	for i, e := range rf.log {
+		if e.Index == logIndex {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 func (rf *Raft) transitionToCandidate() {
@@ -86,6 +96,67 @@ func (rf *Raft) transitionToFollower(newTerm int) {
 	rf.state = Follower
 	rf.currentTerm = newTerm
 	rf.votedFor = ""
+}
+
+// InstallSnapshot - RPC function
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.Lock()
+	defer rf.Unlock()
+
+	reply.Term = rf.currentTerm
+	if reply.Term < rf.currentTerm {
+		return
+	} else if rf.leaderID == args.LeaderId { // Ensure that this peer is the leader
+		rf.persister.SaveSnapshot(args.Data) // Save snapshot, discarding any existing snapshot with smaller index
+
+		i, isPresent := rf.findLogIndex(args.LastIncludedIndex)
+		if isPresent && rf.log[i].Term == args.lastIncludedTerm {
+			// If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it
+			rf.log = rf.log[i+1:]
+		} else { // Otherwise discard the entire log
+			rf.log = make([]LogEntry, 0)
+		}
+
+		rf.lastApplied = 0 // LocalApplyProcess will pick this change up and send snapshot
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	requestName := "Raft.InstallSnapshot"
+	request := func() bool {
+		return rf.peers[server].Call(requestName, args, reply)
+	}
+	return SendRPCRequest(requestName, request)
+}
+
+func (rf *Raft) sendSnapshot(peerIndex int, sendAppendChan chan struct{}) {
+	rf.Lock()
+
+	peerId := string(rune(peerIndex + 'A'))
+	args := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.leaderID,
+		LastIncludedIndex: rf.lastSnapshotIndex,
+		lastIncludedTerm:  rf.lastSnapshotTerm,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	reply := InstallSnapshotReply{}
+	rf.Unlock()
+
+	RaftInfo("Installing snapshot onto %s", rf, peerId)
+	ok := rf.sendInstallSnapshot(peerIndex, &args, &reply)
+
+	rf.Lock()
+	defer rf.Unlock()
+	if ok {
+		if reply.Term > rf.currentTerm {
+			rf.transitionToFollower(reply.Term)
+		} else {
+			rf.nextIndex[peerIndex] = args.LastIncludedIndex + 1
+		}
+	}
+
+	sendAppendChan <- struct{}{} // Signal to leader-peer process that there may be appends to send
 }
 
 // RequestVote - RPC function
@@ -163,8 +234,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	isBeginningOfLog := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
-	if prevLogIndex >= 0 || isBeginningOfLog {
+	PrevIsInSnapshot := args.PreviousLogIndex == rf.lastSnapshotIndex && args.PreviousLogTerm == rf.lastSnapshotTerm
+	PrevIsBeginningOfLog := args.PreviousLogIndex == 0 && args.PreviousLogTerm == 0
+
+	if prevLogIndex >= 0 || PrevIsInSnapshot || PrevIsBeginningOfLog {
 		if len(args.LogEntries) > 0 {
 			RaftInfo("Appending %d entries from %s", rf, len(args.LogEntries), args.LeaderID)
 		}
@@ -244,18 +317,25 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	lastLogIndex, _ := rf.getLastEntryInfo()
 
 	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
-		for i, v := range rf.log { // Need to send logs beginning from index `rf.nextIndex[peerIndex]`
-			if v.Index == rf.nextIndex[peerIndex] {
-				if i > 0 {
-					lastEntry := rf.log[i-1]
-					prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+
+		if rf.nextIndex[peerIndex] <= rf.lastSnapshotIndex { // We don't have the required entry in our log; sending snapshot.
+			rf.Unlock()
+			rf.sendSnapshot(peerIndex, sendAppendChan)
+			return
+		} else {
+			for i, v := range rf.log { // Need to send logs beginning from index `rf.nextIndex[peerIndex]`
+				if v.Index == rf.nextIndex[peerIndex] {
+					if i > 0 {
+						lastEntry := rf.log[i-1]
+						prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+					}
+					entries = make([]LogEntry, len(rf.log)-i)
+					copy(entries, rf.log[i:])
+					break
 				}
-				entries = make([]LogEntry, len(rf.log)-i)
-				copy(entries, rf.log[i:])
-				break
 			}
+			RaftDebug("Sending log %d entries to %s", rf, len(entries), peerId)
 		}
-		RaftDebug("Sending log %d entries to %s", rf, len(entries), peerId)
 	} else { // We're just going to send a heartbeat
 		if len(rf.log) > 0 {
 			lastEntry := rf.log[len(rf.log)-1]
@@ -336,19 +416,35 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 		rf.Lock()
 
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
-			entries := make([]LogEntry, rf.commitIndex-rf.lastApplied)
-			copy(entries, rf.log[rf.lastApplied:rf.commitIndex])
-			RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
-			rf.Unlock()
+			if rf.lastApplied > rf.lastSnapshotIndex { // We need to apply latest snapshot
+				RaftDebug("Locally applying snapshot with latest index: %d", rf, rf.lastSnapshotIndex)
+				rf.Unlock()
 
-			for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
-				RaftDebug("Locally applying log: %s", rf, v)
-				applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+				applyChan <- ApplyMsg{UseSnapshot: true, Snapshot: rf.persister.ReadSnapshot()}
+
+				rf.Lock()
+				rf.lastApplied = rf.lastSnapshotIndex
+				rf.Unlock()
+			} else {
+				startIndex, _ := rf.findLogIndex(rf.lastApplied)
+				startIndex = Max(startIndex, 0) // If start index wasn't found, it's because it's a part of a snapshot
+				endIndex, _ := rf.findLogIndex(rf.commitIndex)
+
+				entries := make([]LogEntry, endIndex-startIndex+1)
+				copy(entries, rf.log[startIndex:endIndex+1])
+
+				RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
+				rf.Unlock()
+
+				for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
+					RaftDebug("Locally applying log: %s", rf, v)
+					applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+				}
+
+				rf.Lock()
+				rf.lastApplied = rf.commitIndex
+				rf.Unlock()
 			}
-
-			rf.Lock()
-			rf.lastApplied += len(entries)
-			rf.Unlock()
 		} else {
 			rf.Unlock()
 			<-time.After(CommitApplyIdleCheckInterval)
@@ -470,11 +566,11 @@ func (rf *Raft) startLeaderPeerProcess(peerIndex int, sendAppendChan chan struct
 		select {
 		case <-sendAppendChan: // Signal that we should send a new append to this peer
 			lastEntrySent = time.Now()
-			go rf.sendAppendEntries(peerIndex, sendAppendChan)
+			rf.sendAppendEntries(peerIndex, sendAppendChan)
 		case currentTime := <-ticker.C: // If traffic has been idle, we should send a heartbeat
 			if currentTime.Sub(lastEntrySent) >= HeartBeatInterval {
 				lastEntrySent = time.Now()
-				go rf.sendAppendEntries(peerIndex, sendAppendChan)
+				rf.sendAppendEntries(peerIndex, sendAppendChan)
 			}
 		}
 	}
@@ -557,14 +653,18 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
+	buf := new(bytes.Buffer)
+	gob.NewEncoder(buf).Encode(
+		RaftPersistence{
+			CurrentTerm:       rf.currentTerm,
+			Log:               rf.log,
+			VotedFor:          rf.votedFor,
+			LastSnapshotIndex: rf.lastSnapshotIndex,
+			LastSnapshotTerm:  rf.lastSnapshotTerm,
+		})
 
-	e.Encode(RaftPersistence{CurrentTerm: rf.currentTerm, Log: rf.log, VotedFor: rf.votedFor})
-
-	data := w.Bytes()
-	RaftDebug("Persisting node data (%d bytes)", rf, len(data))
-	rf.persister.SaveRaftState(data)
+	RaftDebug("Persisting node data (%d bytes)", rf, buf.Len())
+	rf.persister.SaveRaftState(buf.Bytes())
 }
 
 //
@@ -581,7 +681,9 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&obj)
 
 	rf.votedFor, rf.currentTerm, rf.log = obj.VotedFor, obj.CurrentTerm, obj.Log
-	RaftInfo("Loading persisted node data (%d bytes)", rf, len(data))
+	rf.lastSnapshotIndex, rf.lastSnapshotTerm = obj.LastSnapshotIndex, obj.LastSnapshotTerm
+	rf.lastApplied = rf.lastSnapshotIndex
+	RaftInfo("Loaded persisted node data (%d bytes). Last applied index: %d", rf, len(data), rf.lastApplied)
 }
 
 func (rf *Raft) Kill() {
@@ -601,12 +703,15 @@ func (rf *Raft) CompactLog(lastLogIndex int) {
 		RaftInfo("Failed to compact log as log index: %d is larger than commit index: %d", rf, lastLogIndex, rf.commitIndex)
 	}
 
-	for _, v := range rf.log {
-		if v.Index == lastLogIndex {
-			rf.lastSnapshotIndex = v.Index
-			rf.lastSnapshotTerm = v.Term
-		}
+	if i, isPresent := rf.findLogIndex(lastLogIndex); isPresent {
+		entry := rf.log[i]
+		rf.lastSnapshotIndex = entry.Index
+		rf.lastSnapshotTerm = entry.Term
+
+		RaftInfo("Compacting log. Removing %d log entries. LastSnapshotEntry(Index: %d, Term: %d)", rf, i+1, entry.Index, entry.Term)
+		rf.log = rf.log[i+1:]
 	}
 
+	rf.persist()
 	defer rf.Unlock()
 }

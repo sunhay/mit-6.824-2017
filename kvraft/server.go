@@ -216,9 +216,6 @@ func (kv *RaftKV) loadSnapshot(data []byte) {
 	kv.data = obj.Data
 	kv.latestRequests = obj.LatestRequests
 	kvInfo("Loaded snapshot. %d bytes", kv, len(data))
-
-	// Save this loaded snapshot locally
-	kv.persister.SaveSnapshot(data)
 }
 
 //

@@ -50,11 +50,26 @@ func (reply *RequestVoteReply) VoteCount() int {
 	return 0
 }
 
+// InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          string
+	LastIncludedIndex int
+	lastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // RaftPersistence is persisted to the `persister`, and contains all necessary data to restart a failed node
 type RaftPersistence struct {
-	CurrentTerm int
-	Log         []LogEntry
-	VotedFor    string
+	CurrentTerm       int
+	Log               []LogEntry
+	VotedFor          string
+	LastSnapshotIndex int
+	LastSnapshotTerm  int
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -64,6 +79,6 @@ type RaftPersistence struct {
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
-	UseSnapshot bool   // ignore for lab2; only used in lab3
-	Snapshot    []byte // ignore for lab2; only used in lab3
+	UseSnapshot bool
+	Snapshot    []byte
 }
