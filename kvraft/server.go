@@ -11,13 +11,21 @@ import (
 )
 
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
-const SnapshotSizeTolerancePercentage = 1
+const SnapshotSizeTolerancePercentage = 5
 const Debug = 1
 
 func kvInfo(format string, kv *RaftKV, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		args := append([]interface{}{kv.id, len(kv.data)}, a...)
 		log.Printf("[INFO] KV Server: [Id: %s, %d keys] "+format, args...)
+	}
+	return
+}
+
+func kvDebug(format string, kv *RaftKV, a ...interface{}) (n int, err error) {
+	if Debug > 1 {
+		args := append([]interface{}{kv.id, len(kv.data)}, a...)
+		log.Printf("[DEBUG] KV Server: [Id: %s, %d keys] "+format, args...)
 	}
 	return
 }
@@ -149,10 +157,15 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *RaftKV) startApplyProcess() {
 	kvInfo("Starting apply process", kv)
-	for !kv.isDecommissioned {
+	for {
 		select {
 		case m := <-kv.applyCh:
 			kv.Lock()
+
+			if kv.isDecommissioned {
+				kv.Unlock()
+				return
+			}
 
 			if m.UseSnapshot { // ApplyMsg might be a request to load snapshot
 				kv.loadSnapshot(m.Snapshot)
@@ -174,7 +187,7 @@ func (kv *RaftKV) startApplyProcess() {
 					}
 					kv.latestRequests[op.ClientId] = op.RequestId
 				} else {
-					kvInfo("Write request de-duplicated for key: %s. RId: %d, CId: %d", kv, op.Key, op.RequestId, op.ClientId)
+					kvInfo("Write request de-duplicated for key: %s", kv, op.Key)
 				}
 			}
 
@@ -183,7 +196,7 @@ func (kv *RaftKV) startApplyProcess() {
 			}
 
 			// Create snapshot if log is close to reaching max size (within `SnapshotSizeTolerancePercentage`)
-			if kv.snapshotsEnabled && 1-(kv.persister.RaftStateSize()/kv.maxraftstate) >= SnapshotSizeTolerancePercentage/100 {
+			if kv.snapshotsEnabled && 1-(kv.persister.RaftStateSize()/kv.maxraftstate) <= SnapshotSizeTolerancePercentage/100 {
 				kvInfo("Creating snapshot. Raft state size: %d bytes, Max size = %d bytes", kv, kv.persister.RaftStateSize(), kv.maxraftstate)
 				kv.createSnapshot(m.Index)
 			}
@@ -200,7 +213,7 @@ func (kv *RaftKV) createSnapshot(logIndex int) {
 	e.Encode(RaftKVPersistence{Data: kv.data, LatestRequests: kv.latestRequests})
 
 	data := w.Bytes()
-	kvInfo("Saving snapshot. Size: %d bytes", kv, len(data))
+	kvDebug("Saving snapshot. Size: %d bytes", kv, len(data))
 	kv.persister.SaveSnapshot(data)
 
 	// Compact raft log til index.
@@ -225,6 +238,9 @@ func (kv *RaftKV) loadSnapshot(data []byte) {
 // turn off debug output from this instance.
 //
 func (kv *RaftKV) Kill() {
+	kv.Lock()
+	defer kv.Unlock()
+
 	kv.rf.Kill()
 	kv.isDecommissioned = true
 }

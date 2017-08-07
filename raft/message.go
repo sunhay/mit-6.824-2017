@@ -55,7 +55,7 @@ type InstallSnapshotArgs struct {
 	Term              int
 	LeaderId          string
 	LastIncludedIndex int
-	lastIncludedTerm  int
+	LastIncludedTerm  int
 	Data              []byte
 }
 

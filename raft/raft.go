@@ -104,47 +104,57 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	defer rf.Unlock()
 
 	reply.Term = rf.currentTerm
-	if reply.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm {
 		return
-	} else if rf.leaderID == args.LeaderId { // Ensure that this peer is the leader
-		rf.persister.SaveSnapshot(args.Data) // Save snapshot, discarding any existing snapshot with smaller index
-
-		i, isPresent := rf.findLogIndex(args.LastIncludedIndex)
-		if isPresent && rf.log[i].Term == args.lastIncludedTerm {
-			// If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it
-			rf.log = rf.log[i+1:]
-		} else { // Otherwise discard the entire log
-			rf.log = make([]LogEntry, 0)
-		}
-
-		rf.lastApplied = 0 // LocalApplyProcess will pick this change up and send snapshot
+	} else if args.Term >= rf.currentTerm {
+		rf.transitionToFollower(args.Term)
+		rf.leaderID = args.LeaderId
 	}
-}
 
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	requestName := "Raft.InstallSnapshot"
-	request := func() bool {
-		return rf.peers[server].Call(requestName, args, reply)
+	if rf.leaderID == args.LeaderId {
+		rf.lastHeartBeat = time.Now()
 	}
-	return SendRPCRequest(requestName, request)
+
+	rf.persister.SaveSnapshot(args.Data) // Save snapshot, discarding any existing snapshot with smaller index
+
+	i, isPresent := rf.findLogIndex(args.LastIncludedIndex)
+	if isPresent && rf.log[i].Term == args.LastIncludedTerm {
+		// If existing log entry has same index and term as snapshot’s last included entry, retain log entries following it
+		rf.log = rf.log[i+1:]
+	} else { // Otherwise discard the entire log
+		rf.log = make([]LogEntry, 0)
+	}
+
+	rf.lastSnapshotIndex = args.LastIncludedIndex
+	rf.lastSnapshotTerm = args.LastIncludedTerm
+	rf.lastApplied = 0 // LocalApplyProcess will pick this change up and send snapshot
+
+	rf.persist()
+
+	RaftInfo("Installed snapshot from %s, LastSnapshotEntry(Index: %d, Term: %d)", rf, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
 }
 
 func (rf *Raft) sendSnapshot(peerIndex int, sendAppendChan chan struct{}) {
 	rf.Lock()
 
-	peerId := string(rune(peerIndex + 'A'))
+	peer := rf.peers[peerIndex]
 	args := InstallSnapshotArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.leaderID,
 		LastIncludedIndex: rf.lastSnapshotIndex,
-		lastIncludedTerm:  rf.lastSnapshotTerm,
+		LastIncludedTerm:  rf.lastSnapshotTerm,
 		Data:              rf.persister.ReadSnapshot(),
 	}
 	reply := InstallSnapshotReply{}
+
 	rf.Unlock()
 
-	RaftInfo("Installing snapshot onto %s", rf, peerId)
-	ok := rf.sendInstallSnapshot(peerIndex, &args, &reply)
+	// Send RPC (with timeouts + retries)
+	requestName := "Raft.InstallSnapshot"
+	request := func() bool {
+		return peer.Call(requestName, &args, &reply)
+	}
+	ok := SendRPCRequest(requestName, request)
 
 	rf.Lock()
 	defer rf.Unlock()
@@ -190,10 +200,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	RaftInfo("Vote requested for: %s on term: %d. Log up-to-date? %v. Vote granted? %v", rf, args.CandidateID, args.Term, logUpToDate, reply.VoteGranted)
 }
 
-func (rf *Raft) sendRequestVote(server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) sendRequestVote(serverConn *labrpc.ClientEnd, server int, voteChan chan int, args *RequestVoteArgs, reply *RequestVoteReply) {
 	requestName := "Raft.RequestVote"
 	request := func() bool {
-		return rf.peers[server].Call(requestName, args, reply)
+		return serverConn.Call(requestName, args, reply)
 	}
 
 	if ok := SendRPCRequest(requestName, request); ok {
@@ -206,7 +216,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.Lock()
 	defer rf.Unlock()
 
-	RaftDebug("Request from %s, w/ %d entries. Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
+	RaftInfo("Request from %s, w/ %d entries. Args.Prev:[Index %d, Term %d]", rf, args.LeaderID, len(args.LogEntries), args.PreviousLogIndex, args.PreviousLogTerm)
 
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -265,7 +275,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// Update the commit index
 		if args.LeaderCommit > rf.commitIndex {
-			latestLogIndex := rf.log[len(rf.log)-1].Index
+			var latestLogIndex = rf.lastSnapshotIndex
+			if len(rf.log) > 0 {
+				latestLogIndex = rf.log[len(rf.log)-1].Index
+			}
+
 			if args.LeaderCommit < latestLogIndex {
 				rf.commitIndex = args.LeaderCommit
 			} else {
@@ -317,7 +331,6 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 	lastLogIndex, _ := rf.getLastEntryInfo()
 
 	if lastLogIndex > 0 && lastLogIndex >= rf.nextIndex[peerIndex] {
-
 		if rf.nextIndex[peerIndex] <= rf.lastSnapshotIndex { // We don't have the required entry in our log; sending snapshot.
 			rf.Unlock()
 			rf.sendSnapshot(peerIndex, sendAppendChan)
@@ -328,18 +341,22 @@ func (rf *Raft) sendAppendEntries(peerIndex int, sendAppendChan chan struct{}) {
 					if i > 0 {
 						lastEntry := rf.log[i-1]
 						prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+					} else {
+						prevLogIndex, prevLogTerm = rf.lastSnapshotIndex, rf.lastSnapshotTerm
 					}
 					entries = make([]LogEntry, len(rf.log)-i)
 					copy(entries, rf.log[i:])
 					break
 				}
 			}
-			RaftDebug("Sending log %d entries to %s", rf, len(entries), peerId)
+			RaftInfo("Sending log %d entries to %s", rf, len(entries), peerId)
 		}
 	} else { // We're just going to send a heartbeat
 		if len(rf.log) > 0 {
 			lastEntry := rf.log[len(rf.log)-1]
 			prevLogIndex, prevLogTerm = lastEntry.Index, lastEntry.Term
+		} else {
+			prevLogIndex, prevLogTerm = rf.lastSnapshotIndex, rf.lastSnapshotTerm
 		}
 	}
 
@@ -416,8 +433,8 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 		rf.Lock()
 
 		if rf.commitIndex >= 0 && rf.commitIndex > rf.lastApplied {
-			if rf.lastApplied > rf.lastSnapshotIndex { // We need to apply latest snapshot
-				RaftDebug("Locally applying snapshot with latest index: %d", rf, rf.lastSnapshotIndex)
+			if rf.lastApplied < rf.lastSnapshotIndex { // We need to apply latest snapshot
+				RaftInfo("Locally applying snapshot with latest index: %d", rf, rf.lastSnapshotIndex)
 				rf.Unlock()
 
 				applyChan <- ApplyMsg{UseSnapshot: true, Snapshot: rf.persister.ReadSnapshot()}
@@ -426,24 +443,36 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 				rf.lastApplied = rf.lastSnapshotIndex
 				rf.Unlock()
 			} else {
-				startIndex, _ := rf.findLogIndex(rf.lastApplied)
+				startIndex, _ := rf.findLogIndex(rf.lastApplied + 1)
 				startIndex = Max(startIndex, 0) // If start index wasn't found, it's because it's a part of a snapshot
-				endIndex, _ := rf.findLogIndex(rf.commitIndex)
 
-				entries := make([]LogEntry, endIndex-startIndex+1)
-				copy(entries, rf.log[startIndex:endIndex+1])
-
-				RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
-				rf.Unlock()
-
-				for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
-					RaftDebug("Locally applying log: %s", rf, v)
-					applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+				endIndex := -1
+				for i := startIndex; i < len(rf.log); i++ {
+					if rf.log[i].Index <= rf.commitIndex {
+						endIndex = i
+					}
 				}
 
-				rf.Lock()
-				rf.lastApplied = rf.commitIndex
-				rf.Unlock()
+				if endIndex >= 0 { // We have some entries to locally commit
+					entries := make([]LogEntry, endIndex-startIndex+1)
+					copy(entries, rf.log[startIndex:endIndex+1])
+
+					RaftInfo("Locally applying %d log entries. lastApplied: %d. commitIndex: %d", rf, len(entries), rf.lastApplied, rf.commitIndex)
+					rf.Unlock()
+
+					for _, v := range entries { // Hold no locks so that slow local applies don't deadlock the system
+						RaftDebug("Locally applying log: %s", rf, v)
+						applyChan <- ApplyMsg{Index: v.Index, Command: v.Command}
+					}
+
+					rf.Lock()
+					rf.lastApplied += len(entries)
+					rf.Unlock()
+				} else {
+					// TODO: Wtf?
+					RaftInfo("Could not find any entries to locally apply. Last applied: %d, commit index: %d, log size: %d, last included index:%d", rf, rf.lastApplied, rf.commitIndex, len(rf.log), rf.lastSnapshotIndex)
+					rf.Unlock()
+				}
 			}
 		} else {
 			rf.Unlock()
@@ -490,7 +519,7 @@ func (rf *Raft) beginElection() {
 	voteChan := make(chan int, len(rf.peers))
 	for i := range rf.peers {
 		if i != rf.me {
-			go rf.sendRequestVote(i, voteChan, &args, &replies[i])
+			go rf.sendRequestVote(rf.peers[i], i, voteChan, &args, &replies[i])
 		}
 	}
 	rf.persist()
@@ -603,11 +632,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		if len(rf.log) > 0 {
 			return rf.log[len(rf.log)-1].Index + 1
 		}
-		return 1
+		return Max(1, rf.lastSnapshotIndex+1)
 	}()
 
-	rf.log = append(rf.log, LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command})
-	RaftInfo("New entry appended to leader's log: %s", rf, rf.log[nextIndex-1])
+	entry := LogEntry{Index: nextIndex, Term: rf.currentTerm, Command: command}
+	rf.log = append(rf.log, entry)
+	RaftInfo("New entry appended to leader's log: %s", rf, entry)
 
 	return nextIndex, term, isLeader
 }
@@ -698,6 +728,7 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) CompactLog(lastLogIndex int) {
 	rf.Lock()
+	defer rf.Unlock()
 
 	if lastLogIndex > rf.commitIndex {
 		RaftInfo("Failed to compact log as log index: %d is larger than commit index: %d", rf, lastLogIndex, rf.commitIndex)
@@ -713,5 +744,4 @@ func (rf *Raft) CompactLog(lastLogIndex int) {
 	}
 
 	rf.persist()
-	defer rf.Unlock()
 }
