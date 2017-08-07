@@ -1,6 +1,6 @@
 package raftkv
 
-import "github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
+import "github.com/sunhay/mit-6.824-2017/labrpc"
 import "testing"
 import "os"
 
@@ -10,7 +10,7 @@ import "math/rand"
 import "encoding/base64"
 import "sync"
 import "runtime"
-import "github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/raft"
+import "github.com/sunhay/mit-6.824-2017/raft"
 import "fmt"
 
 func randstring(n int) string {

@@ -8,7 +8,7 @@ package raft
 // test with the original before submitting.
 //
 
-import "github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
+import "github.com/sunhay/mit-6.824-2017/labrpc"
 import "log"
 import "sync"
 import "testing"

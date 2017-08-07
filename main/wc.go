@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/mapreduce"
+	"github.com/sunhay/mit-6.824-2017/mapreduce"
 )
 
 // Run using `time go run wc.go master sequential pg-*.txt`

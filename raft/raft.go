@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"encoding/gob"
 
-	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/labrpc"
+	"github.com/sunhay/mit-6.824-2017/labrpc"
 )
 
 type ServerState string

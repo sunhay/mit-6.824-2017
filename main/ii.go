@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/sunhay/scratchpad/golang/mit-6.824-2017/src/mapreduce"
+	"github.com/sunhay/mit-6.824-2017/mapreduce"
 )
 
 // The mapping function is called once for each piece of the input.
