@@ -187,7 +187,7 @@ func (kv *RaftKV) startApplyProcess() {
 					}
 					kv.latestRequests[op.ClientId] = op.RequestId
 				} else {
-					kvInfo("Write request de-duplicated for key: %s", kv, op.Key)
+					kvDebug("Write request de-duplicated for key: %s", kv, op.Key)
 				}
 			}
 

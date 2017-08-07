@@ -44,9 +44,11 @@ type Raft struct {
 	leaderID    string
 
 	// Log state
-	log               []LogEntry
-	commitIndex       int
-	lastApplied       int
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+
+	// Log compaction state, if snapshots are enabled
 	lastSnapshotIndex int
 	lastSnapshotTerm  int
 
@@ -467,12 +469,8 @@ func (rf *Raft) startLocalApplyProcess(applyChan chan ApplyMsg) {
 
 					rf.Lock()
 					rf.lastApplied += len(entries)
-					rf.Unlock()
-				} else {
-					// TODO: Wtf?
-					RaftInfo("Could not find any entries to locally apply. Last applied: %d, commit index: %d, log size: %d, last included index:%d", rf, rf.lastApplied, rf.commitIndex, len(rf.log), rf.lastSnapshotIndex)
-					rf.Unlock()
 				}
+				rf.Unlock()
 			}
 		} else {
 			rf.Unlock()
