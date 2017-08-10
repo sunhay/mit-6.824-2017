@@ -1,7 +1,7 @@
 package shardmaster
 
-import "labrpc"
-import "raft"
+import "github.com/sunhay/mit-6.824-2017/labrpc"
+import "github.com/sunhay/mit-6.824-2017/raft"
 import "testing"
 import "os"
 
