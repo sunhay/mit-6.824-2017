@@ -51,9 +51,31 @@ type Op struct {
 	Args    Arguments
 }
 
-func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
-	op := Op{Command: Join, Args: *args}
+func (sm *ShardMaster) Join(args *JoinArgs, reply *RequestReply) {
+	sm.startRequest(Op{Command: Join, Args: *args}, reply)
+}
 
+func (sm *ShardMaster) Leave(args *LeaveArgs, reply *RequestReply) {
+	sm.startRequest(Op{Command: Leave, Args: *args}, reply)
+}
+
+func (sm *ShardMaster) Move(args *MoveArgs, reply *RequestReply) {
+	sm.startRequest(Op{Command: Move, Args: *args}, reply)
+}
+
+func (sm *ShardMaster) Query(args *QueryArgs, reply *RequestReply) {
+	sm.startRequest(Op{Command: Query, Args: *args}, reply)
+
+	if reply.Err == OK {
+		if args.Num < 0 || args.Num >= len(sm.configs) {
+			reply.Config = sm.configs[len(sm.configs)-1]
+		} else {
+			reply.Config = sm.configs[args.Num]
+		}
+	}
+}
+
+func (sm *ShardMaster) startRequest(op Op, reply *RequestReply) {
 	sm.Lock()
 	index, _, isLeader := sm.rf.Start(op)
 	sm.Unlock()
@@ -61,103 +83,20 @@ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	if !isLeader {
 		reply.WrongLeader = true
 	} else {
-		success := sm.await(index, op)
+		success := sm.awaitApply(index, op)
 		if !success { // Request likely failed due to leadership change
 			reply.WrongLeader = true
-			smInfo("Join(): Failed, node is no longer leader", sm)
+			smInfo("Request failed, node is no longer leader", sm)
 		} else {
 			sm.Lock()
 			reply.Err = OK
 			sm.Unlock()
 		}
 	}
-}
-
-func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
-	op := Op{Command: Leave, Args: *args}
-
-	sm.Lock()
-	index, _, isLeader := sm.rf.Start(op)
-	sm.Unlock()
-
-	if !isLeader {
-		reply.WrongLeader = true
-	} else {
-		success := sm.await(index, op)
-		if !success { // Request likely failed due to leadership change
-			reply.WrongLeader = true
-			smInfo("Leave(): Failed, node is no longer leader", sm)
-		} else {
-			sm.Lock()
-			reply.Err = OK
-			sm.Unlock()
-		}
-	}
-}
-
-func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
-	op := Op{Command: Move, Args: *args}
-
-	sm.Lock()
-	index, _, isLeader := sm.rf.Start(op)
-	sm.Unlock()
-
-	if !isLeader {
-		reply.WrongLeader = true
-	} else {
-		success := sm.await(index, op)
-		if !success { // Request likely failed due to leadership change
-			reply.WrongLeader = true
-			smInfo("Move(): Failed, node is no longer leader", sm)
-		} else {
-			sm.Lock()
-			reply.Err = OK
-			sm.Unlock()
-		}
-	}
-}
-
-func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
-	op := Op{Command: Query, Args: *args}
-
-	sm.Lock()
-	index, _, isLeader := sm.rf.Start(op)
-	sm.Unlock()
-
-	if !isLeader {
-		reply.WrongLeader = true
-	} else {
-		success := sm.await(index, op)
-		if !success { // Request likely failed due to leadership change
-			reply.WrongLeader = true
-			smInfo("Query(): Failed, node is no longer leader", sm)
-		} else {
-			sm.Lock()
-			reply.Err = OK
-			if args.Num < 0 || args.Num >= len(sm.configs) {
-				reply.Config = sm.configs[len(sm.configs)-1]
-			} else {
-				reply.Config = sm.configs[args.Num]
-			}
-			sm.Unlock()
-		}
-	}
-}
-
-func (sm *ShardMaster) Kill() {
-	sm.Lock()
-	defer sm.Unlock()
-	sm.rf.Kill()
-	sm.isDecommissioned = true
-}
-
-// needed by shardkv tester
-func (sm *ShardMaster) Raft() *raft.Raft {
-	return sm.rf
 }
 
 // Returns whether or not this was a successful request
-func (sm *ShardMaster) await(index int, op Op) (success bool) {
+func (sm *ShardMaster) awaitApply(index int, op Op) (success bool) {
 	sm.Lock()
 	awaitChan := make(chan raft.ApplyMsg, 1)
 	sm.requestHandlers[index] = awaitChan
@@ -207,7 +146,7 @@ func (sm *ShardMaster) startApplyProcess() {
 				sm.applyLeave(op.Args.(LeaveArgs))
 			case Move:
 				sm.applyMove(op.Args.(MoveArgs))
-			case Query:
+			case Query: // Read only, no need to modify local state
 				break
 			default:
 				smInfo("Unknown command type %s", sm, op.Command)
@@ -227,6 +166,7 @@ func (sm *ShardMaster) startApplyProcess() {
 // a client will make only one call into a clerk at a time.
 func (sm *ShardMaster) isRequestDuplicate(clientId int64, requestId int64) bool {
 	lastRequest, isPresent := sm.latestRequests[clientId]
+	sm.latestRequests[clientId] = requestId
 	return isPresent && lastRequest == requestId
 }
 
@@ -357,6 +297,18 @@ func (sm *ShardMaster) rebalanceShards(config *Config) {
 			config.Shards[i] = gid
 		}
 	}
+}
+
+func (sm *ShardMaster) Kill() {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.rf.Kill()
+	sm.isDecommissioned = true
+}
+
+// needed by shardkv tester
+func (sm *ShardMaster) Raft() *raft.Raft {
+	return sm.rf
 }
 
 //

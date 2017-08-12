@@ -73,11 +73,6 @@ func (args JoinArgs) String() string {
 	return buffer.String()
 }
 
-type JoinReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
 type LeaveArgs struct {
 	GIDs      []int
 	RequestId int64
@@ -86,11 +81,6 @@ type LeaveArgs struct {
 
 func (args LeaveArgs) String() string {
 	return fmt.Sprintf("GIDs:%v", args.GIDs)
-}
-
-type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
 }
 
 type MoveArgs struct {
@@ -104,19 +94,14 @@ func (args MoveArgs) String() string {
 	return fmt.Sprintf("Shard:%d, GID:%d", args.Shard, args.GID)
 }
 
-type MoveReply struct {
-	WrongLeader bool
-	Err         Err
-}
-
 type QueryArgs struct {
 	Num       int // desired config number
 	RequestId int64
 	ClientId  int64
 }
 
-type QueryReply struct {
+type RequestReply struct {
 	WrongLeader bool
 	Err         Err
-	Config      Config
+	Config      Config // Optional
 }

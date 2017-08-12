@@ -36,7 +36,7 @@ func (ck *Clerk) Query(num int) Config {
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply QueryReply
+			var reply RequestReply
 			ok := srv.Call("ShardMaster.Query", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return reply.Config
@@ -55,7 +55,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply JoinReply
+			var reply RequestReply
 			ok := srv.Call("ShardMaster.Join", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
@@ -74,7 +74,7 @@ func (ck *Clerk) Leave(gids []int) {
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply LeaveReply
+			var reply RequestReply
 			ok := srv.Call("ShardMaster.Leave", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
@@ -94,7 +94,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
-			var reply MoveReply
+			var reply RequestReply
 			ok := srv.Call("ShardMaster.Move", args, &reply)
 			if ok && reply.WrongLeader == false {
 				return
