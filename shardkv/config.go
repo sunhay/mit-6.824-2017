@@ -1,7 +1,7 @@
 package shardkv
 
-import "shardmaster"
-import "labrpc"
+import "github.com/sunhay/mit-6.824-2017/shardmaster"
+import "github.com/sunhay/mit-6.824-2017/labrpc"
 import "testing"
 import "os"
 
@@ -11,7 +11,7 @@ import "math/rand"
 import "encoding/base64"
 import "sync"
 import "runtime"
-import "raft"
+import "github.com/sunhay/mit-6.824-2017/raft"
 import "strconv"
 import "fmt"
 
