@@ -1,5 +1,10 @@
 package shardmaster
 
+import (
+	"bytes"
+	"fmt"
+)
+
 //
 // Master shard server: assigns shards to replication groups.
 //
@@ -14,7 +19,7 @@ package shardmaster
 // #0 is the initial configuration, with no groups and all shards
 // assigned to group 0 (the invalid group).
 //
-// A GID is a replica group ID. GIDs must be uniqe and > 0.
+// A GID is a replica group ID. GIDs must be unique and > 0.
 // Once a GID joins, and leaves, it should never join again.
 //
 // You will need to add fields to the RPC arguments.
@@ -31,6 +36,19 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (c Config) Clone() Config {
+	groups := make(map[int][]string)
+	for k, v := range c.Groups {
+		groups[k] = v
+	}
+
+	return Config{
+		Num:    c.Num,
+		Shards: c.Shards,
+		Groups: groups,
+	}
+}
+
 const (
 	OK = "OK"
 )
@@ -38,7 +56,21 @@ const (
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	RequestId int64
+	ClientId  int64
+}
+
+func (args JoinArgs) String() string {
+	var buffer bytes.Buffer
+	index := 0
+	for k, v := range args.Servers {
+		buffer.WriteString(fmt.Sprintf("%d -> %v", k, v))
+		if index++; index < len(args.Servers) {
+			buffer.WriteString(", ")
+		}
+	}
+	return buffer.String()
 }
 
 type JoinReply struct {
@@ -47,7 +79,13 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	RequestId int64
+	ClientId  int64
+}
+
+func (args LeaveArgs) String() string {
+	return fmt.Sprintf("GIDs:%v", args.GIDs)
 }
 
 type LeaveReply struct {
@@ -56,8 +94,14 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	RequestId int64
+	ClientId  int64
+}
+
+func (args MoveArgs) String() string {
+	return fmt.Sprintf("Shard:%d, GID:%d", args.Shard, args.GID)
 }
 
 type MoveReply struct {
@@ -66,7 +110,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	RequestId int64
+	ClientId  int64
 }
 
 type QueryReply struct {

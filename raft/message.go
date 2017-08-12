@@ -9,7 +9,7 @@ type LogEntry struct {
 }
 
 func (entry LogEntry) String() string {
-	return fmt.Sprintf("LogEntry(Index: %d, Term: %d)", entry.Index, entry.Term)
+	return fmt.Sprintf("(I:%d, T: %d)", entry.Index, entry.Term)
 }
 
 // AppendEntries RPC
