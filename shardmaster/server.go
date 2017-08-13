@@ -66,6 +66,9 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *RequestReply) {
 func (sm *ShardMaster) Query(args *QueryArgs, reply *RequestReply) {
 	sm.startRequest(Op{Command: Query, Args: *args}, reply)
 
+	sm.Lock()
+	defer sm.Unlock()
+
 	if reply.Err == OK {
 		if args.Num < 0 || args.Num >= len(sm.configs) {
 			reply.Config = sm.configs[len(sm.configs)-1]

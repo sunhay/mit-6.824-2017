@@ -12,21 +12,10 @@ import "github.com/sunhay/mit-6.824-2017/labrpc"
 import "crypto/rand"
 import "math/big"
 import "github.com/sunhay/mit-6.824-2017/shardmaster"
-import "time"
-
-//
-// which shard is a key in?
-// please use this function,
-// and please do not change it.
-//
-func key2shard(key string) int {
-	shard := 0
-	if len(key) > 0 {
-		shard = int(key[0])
-	}
-	shard %= shardmaster.NShards
-	return shard
-}
+import (
+	"strconv"
+	"time"
+)
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
@@ -39,7 +28,7 @@ type Clerk struct {
 	sm       *shardmaster.Clerk
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	id       int64
 }
 
 //
@@ -52,11 +41,12 @@ type Clerk struct {
 // send RPCs.
 //
 func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.sm = shardmaster.MakeClerk(masters)
-	ck.make_end = make_end
-	// You'll have to add code here.
-	return ck
+	ck := Clerk{
+		sm:       shardmaster.MakeClerk(masters),
+		make_end: make_end,
+		id:       nrand(),
+	}
+	return &ck
 }
 
 //
@@ -66,8 +56,11 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{
+		Key:       key,
+		ClerkId:   ck.id,
+		RequestId: nrand(),
+	}
 
 	for {
 		shard := key2shard(key)
@@ -76,13 +69,14 @@ func (ck *Clerk) Get(key string) string {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				var reply GetReply
+				var reply RequestReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
-					break
+					si = 0
+					gid, _ = strconv.Atoi(reply.Value)
 				}
 			}
 		}
@@ -99,10 +93,13 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClerkId:   ck.id,
+		RequestId: nrand(),
+	}
 
 	for {
 		shard := key2shard(key)
@@ -110,13 +107,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
+				var reply RequestReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.WrongLeader == false && reply.Err == OK {
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
-					break
+					si = 0
+					gid, _ = strconv.Atoi(reply.Value)
 				}
 			}
 		}

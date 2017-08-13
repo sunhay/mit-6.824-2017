@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging
-const Debug = 1
+const Debug = 0
 
 const RPCTimeout = 50 * time.Millisecond
 const RPCMaxTries = 3
