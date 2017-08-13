@@ -83,10 +83,12 @@ type ShardKV struct {
 	maxraftstate     int // snapshot if log grows this big
 	isDecommissioned bool
 
-	latestConfig    shardmaster.Config
-	data            map[int]map[string]string // Partition ID (int) -> Shard key-values (string -> string)
 	requestHandlers map[int]chan raft.ApplyMsg
-	latestRequests  map[int64]int64 // Client ID -> Last applied Request ID
+
+	// Persistent storage
+	latestConfig   shardmaster.Config
+	data           map[int]map[string]string // Partition ID (int) -> Shard key-values (string -> string)
+	latestRequests map[int64]int64           // Client ID -> Last applied Request ID
 }
 
 func (kv *ShardKV) groupForKey(key string) int {
@@ -143,6 +145,18 @@ func (kv *ShardKV) startClientRequest(op ClientOp, reply *RequestReply) {
 	kv.Unlock()
 
 	kv.startRequest(op, reply)
+
+	if !reply.WrongLeader {
+		kv.Lock()
+		if gid := kv.groupForKey(op.Key); gid != kv.gid {
+			reply.Err = ErrWrongGroup
+			reply.Value = strconv.Itoa(gid)
+			kvInfo("Group no longer owns shard (due to config change)", kv)
+		} else {
+			reply.Err = OK
+		}
+		kv.Unlock()
+	}
 }
 
 func (kv *ShardKV) startRequest(op Op, reply *RequestReply) {
@@ -155,23 +169,7 @@ func (kv *ShardKV) startRequest(op Op, reply *RequestReply) {
 	} else {
 		if success := kv.awaitApply(index, op); !success { // Request likely failed due to leadership change
 			reply.WrongLeader = true
-			return
 		}
-
-		kv.Lock()
-		switch operation := op.(type) {
-		case ClientOp:
-			if gid := kv.groupForKey(operation.Key); gid != kv.gid {
-				reply.Err = ErrWrongGroup
-				reply.Value = strconv.Itoa(gid)
-				kvInfo("Group no longer owns shard (due to config change)", kv)
-			} else {
-				reply.Err = OK
-			}
-		default:
-			// no-op
-		}
-		kv.Unlock()
 	}
 }
 
