@@ -70,14 +70,14 @@ func SendRPCRequest(request func() bool) bool {
 		}
 	}
 
-	for {
+	for attempts := 0; attempts < RPCMaxTries; attempts++ {
 		rpcChan := make(chan struct{}, 1)
 		go makeRequest(rpcChan)
 		select {
 		case <-rpcChan:
 			return true
 		case <-time.After(RPCTimeout):
-			continue
+			// no-op
 		}
 	}
 
