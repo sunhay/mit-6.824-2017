@@ -12,8 +12,12 @@ import (
 
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
 const Debug = 1
+const LogMasterOnly = true
 
 func smInfo(format string, sm *ShardMaster, a ...interface{}) (n int, err error) {
+	if _, isLeader := sm.rf.GetState(); LogMasterOnly && !isLeader {
+		return
+	}
 	if Debug > 0 {
 		args := append([]interface{}{sm.me, len(sm.configs)}, a...)
 		log.Printf("[INFO] Shard Master: [Id: %d, %d configs] "+format, args...)
@@ -330,8 +334,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sm.configs[0].Groups = map[int][]string{}
 
-	smInfo("Starting node", &sm)
-
 	gob.Register(Op{})
 	gob.Register(JoinArgs{})
 	gob.Register(MoveArgs{})
@@ -342,6 +344,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
 	go sm.startApplyProcess()
+
+	smInfo("Started node", &sm)
 
 	return &sm
 }

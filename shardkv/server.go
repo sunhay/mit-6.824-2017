@@ -19,21 +19,28 @@ const ShardMasterCheckInterval = 50 * time.Millisecond
 const SnapshotSizeTolerancePercentage = 5
 
 const Debug = 1
+const LogMasterOnly = true
 
-func kvInfo(format string, kv *ShardKV, a ...interface{}) (n int, err error) {
+func kvInfo(format string, kv *ShardKV, a ...interface{}) {
+	state := kv.StateDescription()
+	if LogMasterOnly && state != "Master" {
+		return
+	}
 	if Debug > 0 {
-		args := append([]interface{}{kv.gid, kv.me, kv.StateDescription(), kv.latestConfig.Num}, a...)
+		args := append([]interface{}{kv.gid, kv.me, state, kv.latestConfig.Num}, a...)
 		log.Printf("[INFO] KV Server: [GId: %d, Id: %d, %s, Config: %d] "+format, args...)
 	}
-	return
 }
 
-func kvDebug(format string, kv *ShardKV, a ...interface{}) (n int, err error) {
-	if Debug > 1 {
-		args := append([]interface{}{kv.gid, kv.me, kv.StateDescription(), kv.latestConfig.Num}, a...)
-		log.Printf("[DEBUG] KV Server: [GId: %d, %s, %d shards] "+format, args...)
+func kvDebug(format string, kv *ShardKV, a ...interface{}) {
+	state := kv.StateDescription()
+	if LogMasterOnly && state != "Master" {
+		return
 	}
-	return
+	if Debug > 1 {
+		args := append([]interface{}{kv.gid, kv.me, state, kv.latestConfig.Num}, a...)
+		log.Printf("[DEBUG] KV Server: [GId: %d, Id: %d, %s, Config: %d] "+format, args...)
+	}
 }
 
 type CommandType int
@@ -411,7 +418,7 @@ func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
 	reply.IsLeader = true
 
 	kv.Lock()
-	if kv.latestConfig.Num >= args.Config.Num {
+	if kv.latestConfig.Num == args.Config.Num {
 		// Copy shard data
 		data := make(map[string]string)
 		for k := range args.Data {
@@ -427,6 +434,8 @@ func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
 		op := ShardTransferOp{Command: ShardTransfer, Num: args.Num, Shard: data, LatestRequests: latestRequests}
 		go kv.startRequest(op, &RequestReply{})
 
+		reply.Err = OK
+	} else if args.Config.Num < kv.latestConfig.Num { // Old config and we've likely already handled this
 		reply.Err = OK
 	}
 	kv.Unlock()
@@ -629,8 +638,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.shardStatus[i] = NotStored
 	}
 
-	kvInfo("Starting group: %d, on node: %d", &kv, gid, me)
-
 	if data := persister.ReadSnapshot(); kv.snapshotsEnabled && data != nil && len(data) > 0 {
 		kv.loadSnapshot(data)
 	}
@@ -649,6 +656,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.startConfigListener()
 	go kv.startApplyProcess()
 	go kv.statusProcess()
+
+	kvInfo("Started group: %d, on node: %d", &kv, gid, me)
 
 	return &kv
 }

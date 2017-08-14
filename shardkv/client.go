@@ -73,10 +73,13 @@ func (ck *Clerk) Get(key string) string {
 				if ok := srv.Call("ShardKV.Get", &args, &reply); ok {
 					if reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 						return reply.Value
-					} else if reply.Err == ErrWrongGroup { // TODO: Clean this up
+					} else if reply.Err == ErrWrongGroup { // Use the received group id for our next request
 						si = 0
 						gid, _ = strconv.Atoi(reply.Value)
-						servers, _ = ck.config.Groups[gid]
+						servers, ok = ck.config.Groups[gid]
+						if !ok {
+							break
+						}
 					} else if reply.Err == ErrMovingShard {
 						si-- // Retry request?
 					}
@@ -114,10 +117,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok := srv.Call("ShardKV.PutAppend", &args, &reply); ok {
 					if reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 						return
-					} else if reply.Err == ErrWrongGroup { // TODO: Clean this up
+					} else if reply.Err == ErrWrongGroup { // Use the received group id for our next request
 						si = 0
 						gid, _ = strconv.Atoi(reply.Value)
-						servers, _ = ck.config.Groups[gid]
+						servers, ok = ck.config.Groups[gid]
+						if !ok {
+							break
+						}
 					} else if reply.Err == ErrMovingShard {
 						si-- // Retry request?
 					}

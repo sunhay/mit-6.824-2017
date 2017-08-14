@@ -77,7 +77,7 @@ func SendRPCRequest(request func() bool) bool {
 		case <-rpcChan:
 			return true
 		case <-time.After(RPCTimeout):
-			// no-op
+			continue
 		}
 	}
 
