@@ -5,28 +5,33 @@ import "github.com/sunhay/mit-6.824-2017/raft"
 import "github.com/sunhay/mit-6.824-2017/shardmaster"
 import "sync"
 import (
+	"bytes"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"reflect"
 	"strconv"
 	"time"
 )
 
+const StatusUpdateInterval = 1000 * time.Millisecond
 const AwaitLeaderCheckInterval = 10 * time.Millisecond
 const ShardMasterCheckInterval = 50 * time.Millisecond
+const SnapshotSizeTolerancePercentage = 5
+
 const Debug = 1
 
 func kvInfo(format string, kv *ShardKV, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		args := append([]interface{}{kv.gid, kv.StateDescription(), len(kv.data)}, a...)
-		log.Printf("[INFO] KV Server: [GId: %d, %s, %d shards] "+format, args...)
+		args := append([]interface{}{kv.gid, kv.me, kv.StateDescription(), len(kv.data)}, a...)
+		log.Printf("[INFO] KV Server: [GId: %d, Id: %d, %s, %d shards] "+format, args...)
 	}
 	return
 }
 
 func kvDebug(format string, kv *ShardKV, a ...interface{}) (n int, err error) {
 	if Debug > 1 {
-		args := append([]interface{}{kv.gid, kv.StateDescription(), len(kv.data)}, a...)
+		args := append([]interface{}{kv.gid, kv.me, kv.StateDescription(), len(kv.data)}, a...)
 		log.Printf("[DEBUG] KV Server: [GId: %d, %s, %d shards] "+format, args...)
 	}
 	return
@@ -39,6 +44,8 @@ const (
 	Append
 	Get
 	ConfigUpdate
+	ShardTransfer
+	MigrationComplete
 )
 
 type Op interface {
@@ -66,6 +73,38 @@ func (op ConfigOp) getCommand() CommandType {
 	return op.Command
 }
 
+type ShardTransferOp struct {
+	Command        CommandType
+	Num            int
+	Shard          map[string]string
+	LatestRequests map[int64]int64
+}
+
+func (op ShardTransferOp) getCommand() CommandType {
+	return op.Command
+}
+
+type ShardState string
+
+const (
+	NotStored     ShardState = "NotStored"
+	Available                = "Avail"
+	MigratingData            = "Migrate"
+	AwaitingData             = "Await"
+)
+
+type SendShardArgs struct {
+	Num            int
+	Data           map[string]string
+	LatestRequests map[int64]int64
+	Config         shardmaster.Config
+}
+
+type SendShardReply struct {
+	IsLeader bool
+	Err      Err
+}
+
 type ShardKV struct {
 	sync.Mutex
 
@@ -81,18 +120,24 @@ type ShardKV struct {
 	masters  []*labrpc.ClientEnd
 
 	maxraftstate     int // snapshot if log grows this big
+	persister        *raft.Persister
+	snapshotsEnabled bool
 	isDecommissioned bool
 
 	requestHandlers map[int]chan raft.ApplyMsg
 
 	// Persistent storage
+	shardStatus    map[int]ShardState
 	latestConfig   shardmaster.Config
-	data           map[int]map[string]string // Partition ID (int) -> Shard key-values (string -> string)
-	latestRequests map[int64]int64           // Client ID -> Last applied Request ID
+	data           map[int]map[string]string // Shard ID (int) -> Shard key-values (string -> string)
+	latestRequests map[int]map[int64]int64   // Shard ID (int) -> Last request key-values (Client ID -> Request ID)
 }
 
-func (kv *ShardKV) groupForKey(key string) int {
-	return kv.latestConfig.Shards[key2shard(key)]
+type ShardKVPersistence struct {
+	LatestConfig   shardmaster.Config
+	ShardStatus    map[int]ShardState
+	Data           map[int]map[string]string
+	LatestRequests map[int]map[int64]int64
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *RequestReply) {
@@ -100,16 +145,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *RequestReply) {
 
 	kv.startClientRequest(op, reply)
 
-	if reply.Err != OK {
-		if !reply.WrongLeader {
-			kvDebug("Get(): Failed for key: %s, Error: %s", kv, args.Key, reply.Err)
-		}
+	if reply.Err != OK || reply.WrongLeader {
+		kvDebug("Get(): Key: %s, shard: %d - Error: %s", kv, args.Key, key2shard(args.Key), reply.Err)
 		return
 	}
 
 	kv.Lock()
 	defer kv.Unlock()
-	kvInfo("Get(): Key %s, shard: %d - Succeeded", kv, args.Key, key2shard(args.Key))
+	kvInfo("Get(): Key: %s, shard: %d - Succeeded", kv, args.Key, key2shard(args.Key))
 	if val, isPresent := kv.data[key2shard(args.Key)][args.Key]; isPresent {
 		reply.Value = val
 	} else {
@@ -127,7 +170,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *RequestReply) {
 
 	kv.startClientRequest(op, reply)
 
-	if reply.Err != OK {
+	if reply.Err != OK || reply.WrongLeader {
 		kvDebug("%s(): Key: %s, shard: %d - Failed", kv, args.Op, args.Key, key2shard(args.Key))
 	} else {
 		kvInfo("%s(): Key: %s, shard: %d - Succeeded", kv, args.Op, args.Key, key2shard(args.Key))
@@ -135,27 +178,33 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *RequestReply) {
 }
 
 func (kv *ShardKV) startClientRequest(op ClientOp, reply *RequestReply) {
-	kv.Lock()
-	if gid := kv.groupForKey(op.Key); gid != kv.gid {
-		reply.Err = ErrWrongGroup
-		reply.Value = strconv.Itoa(gid)
+	setError := func() {
+		kv.Lock()
+		switch kv.shardStatus[key2shard(op.Key)] {
+		case NotStored:
+			fallthrough
+		case MigratingData:
+			reply.Err = ErrWrongGroup
+			reply.Value = strconv.Itoa(kv.latestConfig.Shards[key2shard(op.Key)])
+		case AwaitingData:
+			reply.Err = ErrMovingShard
+		case Available:
+			reply.Err = OK
+		}
 		kv.Unlock()
+	}
+
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.WrongLeader = true
+		return
+	} else if setError(); reply.Err != OK {
 		return
 	}
-	kv.Unlock()
 
 	kv.startRequest(op, reply)
 
 	if !reply.WrongLeader {
-		kv.Lock()
-		if gid := kv.groupForKey(op.Key); gid != kv.gid {
-			reply.Err = ErrWrongGroup
-			reply.Value = strconv.Itoa(gid)
-			kvInfo("Group no longer owns shard (due to config change)", kv)
-		} else {
-			reply.Err = OK
-		}
-		kv.Unlock()
+		setError()
 	}
 }
 
@@ -210,21 +259,34 @@ func (kv *ShardKV) startApplyProcess() {
 		select {
 		case m := <-kv.applyCh:
 			kv.Lock()
-
 			if kv.isDecommissioned {
 				kv.Unlock()
 				return
 			}
 
+			if m.UseSnapshot { // ApplyMsg might be a request to load snapshot
+				kv.loadSnapshot(m.Snapshot)
+				kv.Unlock()
+				continue
+			}
+
 			switch op := m.Command.(type) {
 			case ClientOp:
-				kv.applyClientOperation(op)
+				kv.applyClientOp(op)
 			case ConfigOp:
-				kv.applyConfigOperation(op)
+				kv.applyConfigOp(op)
+			case ShardTransferOp:
+				kv.applyShardTransferOp(op)
 			}
 
 			if c, isPresent := kv.requestHandlers[m.Index]; isPresent {
 				c <- m
+			}
+
+			// Create snapshot if log is close to reaching max size (within `SnapshotSizeTolerancePercentage`)
+			if kv.snapshotsEnabled && 1-(kv.persister.RaftStateSize()/kv.maxraftstate) <= SnapshotSizeTolerancePercentage/100 {
+				kvInfo("Creating snapshot. Raft state size: %d bytes, Max size = %d bytes", kv, kv.persister.RaftStateSize(), kv.maxraftstate)
+				kv.createSnapshot(m.Index)
 			}
 
 			kv.Unlock()
@@ -232,8 +294,20 @@ func (kv *ShardKV) startApplyProcess() {
 	}
 }
 
-func (kv *ShardKV) applyClientOperation(op ClientOp) {
-	if !kv.isRequestDuplicate(op.ClientId, op.RequestId) && op.Command != Get {
+// De-duplicating requests, for "exactly-once" semantics
+// Note: Each RPC implies that the client has seen the reply for its previous RPC. It's OK to assume that
+// a client will make only one call into a clerk at a time.
+func (kv *ShardKV) isRequestDuplicate(shard int, clientId int64, requestId int64) bool {
+	shardRequests, shardPresent := kv.latestRequests[shard]
+	if shardPresent {
+		lastRequest, isPresent := shardRequests[clientId]
+		return isPresent && lastRequest == requestId
+	}
+	return false
+}
+
+func (kv *ShardKV) applyClientOp(op ClientOp) {
+	if !kv.isRequestDuplicate(key2shard(op.Key), op.ClientId, op.RequestId) && op.Command != Get {
 		// Double check that shard exists on this node, then write
 		if shardData, shardPresent := kv.data[key2shard(op.Key)]; shardPresent {
 			if op.Command == Put {
@@ -241,40 +315,133 @@ func (kv *ShardKV) applyClientOperation(op ClientOp) {
 			} else if op.Command == Append {
 				shardData[op.Key] += op.Value
 			}
+			kv.latestRequests[key2shard(op.Key)][op.ClientId] = op.RequestId // Safe since shard exists in `kv.data`
 		}
-		kv.latestRequests[op.ClientId] = op.RequestId
 	}
 }
 
-// De-duplicating requests, for "exactly-once" semantics
-// Note: Each RPC implies that the client has seen the reply for its previous RPC. It's OK to assume that
-// a client will make only one call into a clerk at a time.
-func (kv *ShardKV) isRequestDuplicate(clientId int64, requestId int64) bool {
-	lastRequest, isPresent := kv.latestRequests[clientId]
-	kv.latestRequests[clientId] = requestId
-	return isPresent && lastRequest == requestId
-}
-
-func (kv *ShardKV) applyConfigOperation(op ConfigOp) {
-	existingShardCount := len(kv.data)
-
-	for shardNum, gid := range op.Config.Shards {
-		if _, shardPresent := kv.data[shardNum]; gid == kv.gid && !shardPresent {
-			kv.data[shardNum] = make(map[string]string) // Creating shard
-		} else if gid != kv.gid && shardPresent {
-			delete(kv.data, shardNum) // Deleting shard
-		}
-	}
-
-	if len(kv.data) != existingShardCount {
-		shards := make([]int, 0)
-		for k := range kv.data {
-			shards = append(shards, k)
-		}
-		kvInfo("Configuration change, shard count: [%d -> %d], shards owned: %v", kv, existingShardCount, len(kv.data), shards)
-	}
-
+func (kv *ShardKV) applyConfigOp(op ConfigOp) {
 	kv.latestConfig = op.Config
+	for shardNum, gid := range op.Config.Shards {
+		shardStatus := kv.shardStatus[shardNum]
+		if gid == kv.gid && shardStatus == NotStored {
+			kvInfo("Configuration change: Now owner of shard %d", kv, shardNum)
+			kv.shardStatus[shardNum] = AwaitingData
+			go kv.createShardIfNeeded(shardNum, op)
+		} else if gid != kv.gid && shardStatus == Available {
+			kvInfo("Configuration change: No longer owner of shard %d", kv, shardNum)
+			kv.shardStatus[shardNum] = MigratingData
+			go kv.deleteShard(shardNum, op.Config)
+		} else if gid != kv.gid && shardStatus == AwaitingData {
+			kvInfo("Configuration change: No longer owner of shard %d and it was never transferred to us", kv, shardNum)
+			kv.shardStatus[shardNum] = NotStored
+		}
+	}
+}
+
+func (kv *ShardKV) createShardIfNeeded(shardNum int, op ConfigOp) {
+	createNewShard := func() {
+		kv.Lock()
+		defer kv.Unlock()
+		kv.shardStatus[shardNum] = Available
+		kv.data[shardNum] = make(map[string]string)
+		kv.latestRequests[shardNum] = make(map[int64]int64)
+	}
+
+	// Lets query previous configurations until we either find out there was a previous owner, or confirm that we're the first
+	lastConfig := op.Config
+	for lastConfig.Num > 1 && lastConfig.Shards[shardNum] == kv.gid {
+		lastConfig = kv.sm.Query(lastConfig.Num - 1)
+	}
+
+	if lastConfig.Num == 1 && lastConfig.Shards[shardNum] == kv.gid { // If this is the first config, and we're the owner
+		kvInfo("Creating new shard: %d", kv, shardNum)
+		createNewShard()
+		return
+	} else {
+		kvInfo("Awaiting data for shard: %d from %d", kv, shardNum, lastConfig.Shards[shardNum])
+	}
+}
+
+func (kv *ShardKV) deleteShard(shardNum int, config shardmaster.Config) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		return
+	}
+
+	c := config
+	for {
+		servers := c.Groups[c.Shards[shardNum]]
+
+		kv.Lock()
+		args := SendShardArgs{Num: shardNum, Data: kv.data[shardNum], LatestRequests: kv.latestRequests[shardNum], Config: c}
+		reply := SendShardReply{}
+		kv.Unlock()
+
+		for i := 0; !reply.IsLeader; i++ {
+			request := func() bool {
+				clientEnd := servers[i%len(servers)]
+				kvInfo("Sending shard %d to client: %s", kv, shardNum, clientEnd)
+				return kv.make_end(clientEnd).Call("ShardKV.SendShard", &args, &reply)
+			}
+			SendRPCRequest(request)
+		}
+
+		if reply.Err == OK {
+			kvInfo("Shard: %d successfully transferred", kv, shardNum)
+			kv.startRequest(ShardTransferOp{Command: MigrationComplete, Num: shardNum}, &RequestReply{})
+			break
+		} else { // Update config
+			c = kv.sm.Query(-1)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func (kv *ShardKV) SendShard(args *SendShardArgs, reply *SendShardReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.IsLeader = false
+		return
+	}
+
+	reply.IsLeader = true
+
+	kv.Lock()
+	if kv.latestConfig.Num >= args.Config.Num {
+		// Copy shard data
+		data := make(map[string]string)
+		for k := range args.Data {
+			data[k] = args.Data[k]
+		}
+
+		// Copy shard's latest requests
+		latestRequests := make(map[int64]int64)
+		for k := range args.LatestRequests {
+			latestRequests[k] = args.LatestRequests[k]
+		}
+
+		op := ShardTransferOp{Command: ShardTransfer, Num: args.Num, Shard: data, LatestRequests: latestRequests}
+		go kv.startRequest(op, &RequestReply{})
+
+		reply.Err = OK
+	}
+	kv.Unlock()
+}
+
+func (kv *ShardKV) applyShardTransferOp(op ShardTransferOp) {
+	switch op.Command {
+	case MigrationComplete:
+		delete(kv.data, op.Num)
+		delete(kv.latestRequests, op.Num)
+		kv.shardStatus[op.Num] = NotStored
+	case ShardTransfer:
+		if kv.shardStatus[op.Num] == AwaitingData {
+			kv.data[op.Num] = op.Shard
+			kv.latestRequests[op.Num] = op.LatestRequests
+			kv.shardStatus[op.Num] = Available
+			kvInfo("Data for shard: %d successfully received", kv, op.Num)
+		}
+	}
 }
 
 func (kv *ShardKV) startConfigListener() {
@@ -318,14 +485,72 @@ func (kv *ShardKV) Kill() {
 }
 
 func (kv *ShardKV) StateDescription() string {
-	if kv.rf == nil {
-		return "Replica"
+	if kv.rf != nil {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			return "Master"
+		}
 	}
+	return "Replica"
+}
 
-	if _, isLeader := kv.rf.GetState(); isLeader {
-		return "Master"
-	} else {
-		return "Replica"
+func (kv *ShardKV) createSnapshot(logIndex int) {
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+
+	persistence := ShardKVPersistence{
+		Data:           kv.data,
+		LatestRequests: kv.latestRequests,
+		LatestConfig:   kv.latestConfig,
+		ShardStatus:    kv.shardStatus,
+	}
+	e.Encode(persistence)
+
+	data := w.Bytes()
+	kvDebug("Saving snapshot. Size: %d bytes", kv, len(data))
+	kv.persister.SaveSnapshot(data)
+
+	// Compact raft log til index.
+	kv.rf.CompactLog(logIndex)
+}
+
+func (kv *ShardKV) loadSnapshot(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	obj := ShardKVPersistence{}
+	d.Decode(&obj)
+
+	kv.data = obj.Data
+	kv.latestRequests = obj.LatestRequests
+	kv.latestConfig = obj.LatestConfig
+	kv.shardStatus = obj.ShardStatus
+	kvInfo("Loaded snapshot. %d bytes", kv, len(data))
+}
+
+func (kv *ShardKV) statusProcess() {
+	timer := time.NewTicker(StatusUpdateInterval)
+
+	for {
+		select {
+		case <-timer.C:
+			kv.Lock()
+			if kv.isDecommissioned {
+				kv.Unlock()
+				return
+			} else {
+				var buffer bytes.Buffer
+				element := -1
+				for k, v := range kv.shardStatus {
+					if v != NotStored {
+						if element++; element > 0 {
+							buffer.WriteString(", ")
+						}
+						buffer.WriteString(fmt.Sprintf("%d -> %v", k, v))
+					}
+				}
+				kvInfo("Shard state update: [%s]", kv, buffer.String())
+				kv.Unlock()
+			}
+		}
 	}
 }
 
@@ -361,26 +586,47 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call gob.Register on structures you want Go's RPC library to marshall/unmarshall.
 	gob.Register(ClientOp{})
 	gob.Register(ConfigOp{})
+	gob.Register(SendShardArgs{})
+	gob.Register(SendShardReply{})
+	gob.Register(ShardTransferOp{})
 
 	kv := ShardKV{
-		me:              me,
-		maxraftstate:    maxraftstate,
-		make_end:        make_end,
-		gid:             gid,
-		masters:         masters,
-		applyCh:         make(chan raft.ApplyMsg),
-		requestHandlers: make(map[int]chan raft.ApplyMsg),
-		data:            make(map[int]map[string]string),
-		latestRequests:  make(map[int64]int64),
+		me:               me,
+		maxraftstate:     maxraftstate,
+		make_end:         make_end,
+		gid:              gid,
+		masters:          masters,
+		persister:        persister,
+		applyCh:          make(chan raft.ApplyMsg),
+		requestHandlers:  make(map[int]chan raft.ApplyMsg),
+		data:             make(map[int]map[string]string),
+		latestRequests:   make(map[int]map[int64]int64),
+		shardStatus:      make(map[int]ShardState),
+		snapshotsEnabled: maxraftstate != -1,
+	}
+
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.shardStatus[i] = NotStored
 	}
 
 	kvInfo("Starting group: %d, on node: %d", &kv, gid, me)
 
+	if data := persister.ReadSnapshot(); kv.snapshotsEnabled && data != nil && len(data) > 0 {
+		kv.loadSnapshot(data)
+	}
+
 	kv.sm = shardmaster.MakeClerk(kv.masters)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	for i := 0; i < shardmaster.NShards; i++ {
+		if kv.shardStatus[i] == MigratingData {
+			go kv.deleteShard(i, kv.latestConfig)
+		}
+	}
+
 	go kv.startConfigListener()
 	go kv.startApplyProcess()
+	go kv.statusProcess()
 
 	return &kv
 }

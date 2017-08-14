@@ -70,13 +70,16 @@ func (ck *Clerk) Get(key string) string {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply RequestReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					si = 0
-					gid, _ = strconv.Atoi(reply.Value)
+				if ok := srv.Call("ShardKV.Get", &args, &reply); ok {
+					if reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
+						return reply.Value
+					} else if reply.Err == ErrWrongGroup { // TODO: Clean this up
+						si = 0
+						gid, _ = strconv.Atoi(reply.Value)
+						servers, _ = ck.config.Groups[gid]
+					} else if reply.Err == ErrMovingShard {
+						si-- // Retry request?
+					}
 				}
 			}
 		}
@@ -108,13 +111,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
 				var reply RequestReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.WrongLeader == false && reply.Err == OK {
-					return
-				}
-				if ok && reply.Err == ErrWrongGroup {
-					si = 0
-					gid, _ = strconv.Atoi(reply.Value)
+				if ok := srv.Call("ShardKV.PutAppend", &args, &reply); ok {
+					if reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
+						return
+					} else if reply.Err == ErrWrongGroup { // TODO: Clean this up
+						si = 0
+						gid, _ = strconv.Atoi(reply.Value)
+						servers, _ = ck.config.Groups[gid]
+					} else if reply.Err == ErrMovingShard {
+						si-- // Retry request?
+					}
 				}
 			}
 		}

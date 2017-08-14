@@ -1,6 +1,9 @@
 package shardkv
 
-import "github.com/sunhay/mit-6.824-2017/shardmaster"
+import (
+	"github.com/sunhay/mit-6.824-2017/shardmaster"
+	"time"
+)
 
 //
 // Sharded key/value server.
@@ -11,10 +14,14 @@ import "github.com/sunhay/mit-6.824-2017/shardmaster"
 // You will have to modify these definitions.
 //
 
+const RPCTimeout = 50 * time.Millisecond
+const RPCMaxTries = 3
+
 const (
-	OK            = "OK"
-	ErrNoKey      = "ErrNoKey"
-	ErrWrongGroup = "ErrWrongGroup"
+	OK             = "OK"
+	ErrNoKey       = "ErrNoKey"
+	ErrWrongGroup  = "ErrWrongGroup"
+	ErrMovingShard = "ErrShardMigrating"
 )
 
 type Err string
@@ -53,4 +60,26 @@ func key2shard(key string) int {
 	}
 	shard %= shardmaster.NShards
 	return shard
+}
+
+// SendRPCRequest will keep trying to send an RPC until it succeeds (with timeouts, per request)
+func SendRPCRequest(request func() bool) bool {
+	makeRequest := func(successChan chan struct{}) {
+		if ok := request(); ok {
+			successChan <- struct{}{}
+		}
+	}
+
+	for {
+		rpcChan := make(chan struct{}, 1)
+		go makeRequest(rpcChan)
+		select {
+		case <-rpcChan:
+			return true
+		case <-time.After(RPCTimeout):
+			continue
+		}
+	}
+
+	return false
 }
